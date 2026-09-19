@@ -44,12 +44,25 @@ def main() -> None:
     config_path = (ROOT / args.config).resolve()
     if not config_path.is_file():
         raise FileNotFoundError(config_path)
-    if not args.skip_prepare:
-        prepare(args.dataset or "ponschannel/farmos-v32-training-data")
 
     dataset = ROOT / "data/top_tier/live_v2/transitions.parquet"
     stage0 = ROOT / "data/top_tier/live_v2/manifests/STAGE0_ACCEPTED.json"
     stage1 = ROOT / "checkpoints/rl_v2_stage1/STAGE1_ACCEPTED.json"
+    required_training_artifacts = (dataset, stage0, stage1)
+    missing_training_artifacts = [
+        path for path in required_training_artifacts if not path.is_file()
+    ]
+    if not args.skip_prepare or missing_training_artifacts:
+        if args.skip_prepare and missing_training_artifacts:
+            print(
+                "FARMOS_PREPARE_FALLBACK="
+                + json.dumps(
+                    [str(path) for path in missing_training_artifacts],
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        prepare(args.dataset or "ponschannel/farmos-v32-training-data")
     values = load_config(config_path)
     scratch_init = str(values.get("init_mode", "checkpoint")) == "scratch"
     if scratch_init:
