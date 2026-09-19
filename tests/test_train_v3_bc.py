@@ -867,6 +867,84 @@ def test_v32_gpu_batch_cache_matches_uncached_tensor_path(tmp_path):
         assert torch.equal(got.write_pos, expected.write_pos)
 
 
+
+def test_v32_gpu_batch_disk_cache_round_trip(tmp_path):
+    from dataclasses import replace
+    from kaggrl.v2_training_data import V2EpisodeDataset
+    from kaggrl.v3_2_model import TemporalIntentPolicyV32
+    from kaggrl.v3_2_schema import (
+        ARCHITECTURE_VERSION as V32_ARCHITECTURE_VERSION,
+    )
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.train_v3_bc import _prepare_gpu_batch_cache
+
+    dataset, stage0, stage1, _ = _fixture(tmp_path)
+    train = V2EpisodeDataset(dataset, "train", {"active_best"})
+    manifest = build_strategy_manifest([1])
+    config = replace(
+        _config(dataset, stage0, stage1, tmp_path / "disk-cache"),
+        sequence_len=2,
+        batch_sequences=1,
+        model_architecture=V32_ARCHITECTURE_VERSION,
+        strategy_conditioning=True,
+        gpu_tensor_training=True,
+        gpu_batch_cache=True,
+        gpu_batch_cache_disk=True,
+    )
+    model = TemporalIntentPolicyV32(strategy_count=1).eval()
+
+    first_groups, first_stats = _prepare_gpu_batch_cache(
+        model,
+        train,
+        config,
+        torch.device("cpu"),
+        manifest,
+        dataset_sha="a" * 64,
+        effective_action_sha="b" * 64,
+    )
+    assert first_groups
+    assert first_stats["disk_cache_hit"] is False
+    cache_dir = Path(first_stats["disk_cache_dir"])
+    assert (cache_dir / "manifest.json").is_file()
+
+    second_groups, second_stats = _prepare_gpu_batch_cache(
+        model,
+        train,
+        config,
+        torch.device("cpu"),
+        manifest,
+        dataset_sha="a" * 64,
+        effective_action_sha="b" * 64,
+    )
+    assert second_groups
+    assert second_stats["disk_cache_hit"] is True
+    assert second_stats["cached_updates"] == first_stats["cached_updates"]
+    assert second_stats["tensor_bytes"] == first_stats["tensor_bytes"]
+
+    first_cached = next(
+        update.cached
+        for group in first_groups
+        for update in group.updates
+        if update.cached is not None
+    )
+    second_cached = next(
+        update.cached
+        for group in second_groups
+        for update in group.updates
+        if update.cached is not None
+    )
+    assert first_cached.slots == second_cached.slots
+    assert first_cached.steps == second_cached.steps
+    assert torch.equal(
+        first_cached.ledger.cash,
+        second_cached.ledger.cash,
+    )
+    assert torch.equal(
+        first_cached.targets.unit_op,
+        second_cached.targets.unit_op,
+    )
+
+
 def test_v32_train_epoch_uses_prepared_gpu_batch_cache(tmp_path):
     from dataclasses import replace
     from kaggrl.v2_training_data import V2EpisodeDataset

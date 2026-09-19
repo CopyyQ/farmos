@@ -42,6 +42,7 @@
   "clear_cuda_cache": false,
   "gpu_tensor_training": true,
   "gpu_batch_cache": true,
+  "gpu_batch_cache_disk": true,
   "gpu_batch_cache_reserve_gb": 3.0,
   "gpu_batch_cache_pin_cpu": true
 }

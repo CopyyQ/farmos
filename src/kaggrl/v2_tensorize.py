@@ -4,6 +4,8 @@ import hashlib
 import json
 import math
 from copy import deepcopy
+
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -283,13 +285,57 @@ def _grid_tensor(grid: Any) -> torch.Tensor:
     width = max((len(row) for row in rows), default=0)
     if height != width:
         raise ValueError(f"farm grid must be square, got {height}x{width}")
-    out = torch.zeros((height, width, len(TILE_FEATURES)), dtype=torch.float32)
+
+    # Avoid creating one tiny torch tensor per tile. On the accepted corpus
+    # this function is called more than 100k times during cache construction;
+    # filling one contiguous NumPy buffer is dramatically cheaper.
+    out = np.zeros(
+        (height, width, len(TILE_FEATURES)),
+        dtype=np.float32,
+    )
+    denom = max(1, width - 1)
+    bool_fields = (
+        "watered_today",
+        "fed_today",
+        "cared_today",
+        "fertilizer_available",
+    )
+    numeric_fields = (
+        "yield_units",
+        "planted_day",
+        "placed_day",
+        "max_lifespan_step",
+        "fertilized_until_day",
+        "consecutive_unwatered",
+        "consecutive_unfed",
+        "pending_care_bonus",
+    )
+
     for y, row in enumerate(rows):
         if len(row) != width:
             raise ValueError("ragged farm grid")
         for x, tile in enumerate(row):
-            out[y, x] = _tile_vector(tile, x, y, width)
-    return out
+            cell = out[y, x]
+            cell[TILE_FEATURE_INDEX["x"]] = float(x) / denom
+            cell[TILE_FEATURE_INDEX["y"]] = float(y) / denom
+            kind = _tile_kind(tile)
+            cell[TILE_FEATURE_INDEX[f"kind:{kind}"]] = 1.0
+            data = tile if isinstance(tile, dict) else {}
+            crop = data.get("crop")
+            animal = data.get("animal")
+            if crop in CROPS:
+                cell[TILE_FEATURE_INDEX[f"crop:{crop}"]] = 1.0
+            if animal in ANIMALS:
+                cell[TILE_FEATURE_INDEX[f"animal:{animal}"]] = 1.0
+            for name in bool_fields:
+                cell[TILE_FEATURE_INDEX[name]] = float(
+                    bool(data.get(name, False))
+                )
+            for name in numeric_fields:
+                cell[TILE_FEATURE_INDEX[name]] = signed_log1p(
+                    data.get(name, 0) or 0
+                )
+    return torch.from_numpy(out)
 
 
 def _unit_vector(unit: Any, *, board_size: int, own_private: bool) -> torch.Tensor:
@@ -324,10 +370,65 @@ def _units_tensor(units: Any, *, board_size: int, own_private: bool) -> torch.Te
     values = list(units or [])
     if not values:
         return torch.zeros((0, len(UNIT_FEATURES)), dtype=torch.float32)
-    return torch.stack([
-        _unit_vector(unit, board_size=board_size, own_private=own_private)
-        for unit in values
-    ])
+
+    out = np.zeros(
+        (len(values), len(UNIT_FEATURES)),
+        dtype=np.float32,
+    )
+    denom = max(1, board_size - 1)
+    half = board_size // 2
+    depot_access = (
+        (half - 1, half - 1),
+        (half, half - 1),
+        (half - 1, half),
+        (half, half),
+    )
+    for row, unit in enumerate(values):
+        data = _mapping(unit)
+        kind = str(data.get("kind", "hand"))
+        out[row, UNIT_FEATURE_INDEX["kind:farmer"]] = float(
+            kind == "farmer"
+        )
+        out[row, UNIT_FEATURE_INDEX["kind:hand"]] = float(
+            kind == "hand"
+        )
+        actor_position = (
+            0 if kind == "farmer"
+            else int(data.get("index", 0)) + 1
+        )
+        out[row, UNIT_FEATURE_INDEX["actor_index_log"]] = math.log1p(
+            max(0, actor_position)
+        )
+        out[row, UNIT_FEATURE_INDEX["actor_index_sin"]] = math.sin(
+            float(actor_position)
+        )
+        out[row, UNIT_FEATURE_INDEX["actor_index_cos"]] = math.cos(
+            float(actor_position)
+        )
+        position = data.get("position") or [0, 0]
+        if isinstance(position, (list, tuple)) and len(position) >= 2:
+            px, py = int(position[0]), int(position[1])
+            out[row, UNIT_FEATURE_INDEX["x"]] = float(px) / denom
+            out[row, UNIT_FEATURE_INDEX["y"]] = float(py) / denom
+            distance = min(
+                abs(px - dx) + abs(py - dy)
+                for dx, dy in depot_access
+            )
+            out[row, UNIT_FEATURE_INDEX["depot_distance"]] = (
+                float(distance) / denom
+            )
+        if own_private:
+            inventory = data.get("inventory")
+            inventory = (
+                inventory if isinstance(inventory, dict) else {}
+            )
+            for item, amount in inventory.items():
+                if item in ITEM_NAMES:
+                    out[
+                        row,
+                        UNIT_FEATURE_INDEX[f"inventory:{item}"],
+                    ] = signed_log1p(amount or 0)
+    return torch.from_numpy(out)
 
 
 def _commodity_tensor(state: Any) -> torch.Tensor:
@@ -340,20 +441,41 @@ def _commodity_tensor(state: Any) -> torch.Tensor:
     carried = {name: 0 for name in COMMODITY_NAMES}
     for unit in list(_field(state, "own_units", []) or []):
         inventory = _mapping(_mapping(unit).get("inventory") or {})
-        for name in COMMODITY_NAMES:
-            carried[name] += int(inventory.get(name, 0) or 0)
-    out = torch.zeros((len(COMMODITY_NAMES), len(COMMODITY_FEATURES)), dtype=torch.float32)
+        for name, amount in inventory.items():
+            if name in carried:
+                carried[name] += int(amount or 0)
+
+    out = np.zeros(
+        (len(COMMODITY_NAMES), len(COMMODITY_FEATURES)),
+        dtype=np.float32,
+    )
     for row, name in enumerate(COMMODITY_NAMES):
         out[row, COMMODITY_FEATURE_INDEX[f"item:{name}"]] = 1.0
-        out[row, COMMODITY_FEATURE_INDEX["is_crop"]] = float(name in CROPS)
-        out[row, COMMODITY_FEATURE_INDEX["is_animal"]] = float(name in ANIMALS)
-        out[row, COMMODITY_FEATURE_INDEX["is_product"]] = float(name in PRODUCTS)
-        out[row, COMMODITY_FEATURE_INDEX["shed_quantity"]] = signed_log1p(shed.get(name, 0))
-        out[row, COMMODITY_FEATURE_INDEX["seed_quantity"]] = signed_log1p(seeds.get(name, 0))
-        out[row, COMMODITY_FEATURE_INDEX["carried_quantity"]] = signed_log1p(carried[name])
-        out[row, COMMODITY_FEATURE_INDEX["market_inventory"]] = signed_log1p(market_inventory.get(name, 0))
-        out[row, COMMODITY_FEATURE_INDEX["market_price"]] = signed_log1p(market_prices.get(name, 0))
-    return out
+        out[row, COMMODITY_FEATURE_INDEX["is_crop"]] = float(
+            name in CROPS
+        )
+        out[row, COMMODITY_FEATURE_INDEX["is_animal"]] = float(
+            name in ANIMALS
+        )
+        out[row, COMMODITY_FEATURE_INDEX["is_product"]] = float(
+            name in PRODUCTS
+        )
+        out[row, COMMODITY_FEATURE_INDEX["shed_quantity"]] = signed_log1p(
+            shed.get(name, 0)
+        )
+        out[row, COMMODITY_FEATURE_INDEX["seed_quantity"]] = signed_log1p(
+            seeds.get(name, 0)
+        )
+        out[row, COMMODITY_FEATURE_INDEX["carried_quantity"]] = signed_log1p(
+            carried[name]
+        )
+        out[row, COMMODITY_FEATURE_INDEX["market_inventory"]] = signed_log1p(
+            market_inventory.get(name, 0)
+        )
+        out[row, COMMODITY_FEATURE_INDEX["market_price"]] = signed_log1p(
+            market_prices.get(name, 0)
+        )
+    return torch.from_numpy(out)
 
 
 def _previous_unit_action_vector(command: Any) -> torch.Tensor:
@@ -490,7 +612,7 @@ def _next_hire_cost(hires_today: int) -> int:
 
 
 def _economy_tensor(state: Any) -> torch.Tensor:
-    out = torch.zeros(len(ECONOMY_FEATURES), dtype=torch.float32)
+    out = np.zeros(len(ECONOMY_FEATURES), dtype=np.float32)
     step = int(_field(state, "step", 0) or 0)
     day = int(_field(state, "day", step // 24) or 0)
     hour = int(_field(state, "hour", step % 24) or 0)
@@ -541,8 +663,10 @@ def _economy_tensor(state: Any) -> torch.Tensor:
     if not shops:
         shops = list(_mapping(_field(state, "town", {})).get("unlocked_shops") or [])
     for shop in SHOP_NAMES:
-        out[ECONOMY_FEATURE_INDEX[f"shop_count:{shop}"]] = signed_log1p(shops.count(shop))
-    return out
+        out[ECONOMY_FEATURE_INDEX[f"shop_count:{shop}"]] = signed_log1p(
+            shops.count(shop)
+        )
+    return torch.from_numpy(out)
 
 
 def _effect_tensor(effect: Any) -> torch.Tensor:

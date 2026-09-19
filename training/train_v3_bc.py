@@ -79,6 +79,8 @@ SELECTION_WEIGHTS = {
     "market_sequence_exact": 0.30,
     "full_joint_step_exact": 0.10,
 }
+GPU_BATCH_CACHE_FORMAT_VERSION = 1
+
 V32_SELECTION_WEIGHTS = {
     "farmer_semantic_exact": 0.25,
     "mean_hand_semantic_exact": 0.25,
@@ -147,6 +149,7 @@ class BCV3Config:
     clear_cuda_cache: bool = True
     gpu_tensor_training: bool = False
     gpu_batch_cache: bool = False
+    gpu_batch_cache_disk: bool = False
     gpu_batch_cache_reserve_gb: float = 3.0
     gpu_batch_cache_pin_cpu: bool = True
 
@@ -1151,12 +1154,278 @@ def _teacher_chunk_cached(
     return _mean_tensor_dict(step_losses), states
 
 
+
+def _gpu_batch_disk_cache_identity(
+    config: BCV3Config,
+    *,
+    dataset_sha: str,
+    effective_action_sha: str | None,
+    strategy_manifest: StrategyManifest | None,
+) -> tuple[Path, dict[str, Any]]:
+    identity = {
+        "format_version": int(GPU_BATCH_CACHE_FORMAT_VERSION),
+        "dataset_sha256": str(dataset_sha),
+        "effective_action_sha256": effective_action_sha,
+        "sequence_len": int(config.sequence_len),
+        "batch_sequences": int(config.batch_sequences),
+        "seed": int(config.seed),
+        "model_architecture": str(config.model_architecture),
+        "strategy_manifest_sha256": (
+            None if strategy_manifest is None else strategy_manifest.sha256
+        ),
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:24]
+    root = (
+        Path(config.dataset_path).resolve().parent
+        / ".farmos_tensor_cache"
+        / digest
+    )
+    return root, identity
+
+
+def _gpu_batch_disk_cache_specs(dataset, config: BCV3Config):
+    groups = []
+    for episodes in _episode_groups(
+        dataset,
+        config.batch_sequences,
+        config.seed,
+        0,
+    ):
+        chunks_by_slot = [
+            _episode_chunks(ep, config.sequence_len)
+            for ep in episodes
+        ]
+        max_chunks = max(len(chunks) for chunks in chunks_by_slot)
+        updates = []
+        for chunk_index in range(max_chunks):
+            active = tuple(
+                (slot, chunks[chunk_index])
+                for slot, chunks in enumerate(chunks_by_slot)
+                if chunk_index < len(chunks)
+            )
+            updates.append(active)
+        groups.append((len(chunks_by_slot), tuple(updates)))
+    return tuple(groups)
+
+
+def _place_cached_tensors(
+    flat,
+    targets,
+    ledger,
+    strategy_slots,
+    *,
+    device: torch.device,
+    reserve_bytes: int,
+    tensor_bytes: int,
+    pin_cpu: bool,
+):
+    resident_on_device = False
+    if device.type == "cuda" and torch.cuda.is_available():
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if tensor_bytes <= max(0, int(free_bytes) - reserve_bytes):
+            try:
+                flat = _step_batch_to_device(flat, device)
+                targets = _dataclass_to_device(targets, device)
+                ledger = _dataclass_to_device(ledger, device)
+                if torch.is_tensor(strategy_slots):
+                    strategy_slots = strategy_slots.to(device)
+                resident_on_device = True
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                resident_on_device = False
+
+    if (
+        not resident_on_device
+        and pin_cpu
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+    ):
+        try:
+            flat = _pin_step_batch(flat)
+            targets = _pin_tensor_dataclass(targets)
+            ledger = _pin_tensor_dataclass(ledger)
+            if (
+                torch.is_tensor(strategy_slots)
+                and strategy_slots.device.type == "cpu"
+            ):
+                strategy_slots = strategy_slots.pin_memory()
+        except RuntimeError:
+            pass
+    return flat, targets, ledger, strategy_slots, resident_on_device
+
+
+def _try_load_gpu_batch_disk_cache(
+    dataset,
+    config: BCV3Config,
+    device,
+    strategy_manifest: StrategyManifest | None,
+    *,
+    dataset_sha: str | None,
+    effective_action_sha: str | None,
+):
+    if (
+        not bool(config.gpu_batch_cache_disk)
+        or not dataset_sha
+    ):
+        return None
+
+    cache_root, identity = _gpu_batch_disk_cache_identity(
+        config,
+        dataset_sha=dataset_sha,
+        effective_action_sha=effective_action_sha,
+        strategy_manifest=strategy_manifest,
+    )
+    manifest_path = cache_root / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        manifest.get("complete") is not True
+        or manifest.get("identity") != identity
+    ):
+        return None
+
+    specs = _gpu_batch_disk_cache_specs(dataset, config)
+    file_names = list(manifest.get("files") or [])
+    files = [cache_root / str(name) for name in file_names]
+    if not files or any(not path.is_file() for path in files):
+        return None
+
+    started = time.perf_counter()
+    device = torch.device(device)
+    reserve_bytes = int(
+        float(config.gpu_batch_cache_reserve_gb) * (1024 ** 3)
+    )
+    stats = {
+        "enabled": True,
+        "disk_cache_hit": True,
+        "disk_cache_dir": str(cache_root),
+        "cached_updates": 0,
+        "gpu_resident_updates": 0,
+        "cpu_resident_updates": 0,
+        "fallback_updates": 0,
+        "tensor_bytes": 0,
+        "gpu_tensor_bytes": 0,
+        "cpu_tensor_bytes": 0,
+        "built_updates": 0,
+        "collate_seconds": 0.0,
+        "target_seconds": 0.0,
+        "ledger_seconds": 0.0,
+        "transfer_seconds": 0.0,
+        "build_seconds": 0.0,
+        "disk_load_seconds": 0.0,
+    }
+    groups = []
+    file_cursor = 0
+    for group_index, (slot_count, updates_spec) in enumerate(specs):
+        updates = []
+        for update_index, active in enumerate(updates_spec):
+            chunks = [chunk for _, chunk in active]
+            lengths = [len(chunk.rows) for chunk in chunks]
+            cacheable = (
+                bool(lengths)
+                and len(set(lengths)) == 1
+                and lengths[0] <= int(manifest.get("core_window", 10**9))
+            )
+            cached = None
+            if cacheable:
+                if file_cursor >= len(files):
+                    return None
+                payload = torch.load(
+                    files[file_cursor],
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                file_cursor += 1
+                slots = tuple(int(value) for value in payload["slots"])
+                if slots != tuple(slot for slot, _ in active):
+                    return None
+                tensor_bytes = int(payload["tensor_bytes"])
+                transfer_started = time.perf_counter()
+                (
+                    flat,
+                    targets,
+                    ledger,
+                    strategy_slots,
+                    resident_on_device,
+                ) = _place_cached_tensors(
+                    payload["flat"],
+                    payload["targets"],
+                    payload["ledger"],
+                    payload.get("strategy_slots"),
+                    device=device,
+                    reserve_bytes=reserve_bytes,
+                    tensor_bytes=tensor_bytes,
+                    pin_cpu=bool(config.gpu_batch_cache_pin_cpu),
+                )
+                stats["transfer_seconds"] += float(
+                    time.perf_counter() - transfer_started
+                )
+                cached = _CachedTensorSequence(
+                    slots=slots,
+                    steps=int(payload["steps"]),
+                    flat=flat,
+                    targets=targets,
+                    ledger=ledger,
+                    strategy_slots=strategy_slots,
+                    resident_on_device=resident_on_device,
+                    tensor_bytes=tensor_bytes,
+                )
+                stats["cached_updates"] += 1
+                stats["tensor_bytes"] += tensor_bytes
+                if resident_on_device:
+                    stats["gpu_resident_updates"] += 1
+                    stats["gpu_tensor_bytes"] += tensor_bytes
+                else:
+                    stats["cpu_resident_updates"] += 1
+                    stats["cpu_tensor_bytes"] += tensor_bytes
+            else:
+                stats["fallback_updates"] += 1
+            stats["built_updates"] += 1
+            updates.append(
+                _PreparedTrainingUpdate(active=active, cached=cached)
+            )
+        groups.append(
+            _PreparedTrainingGroup(
+                slot_count=int(slot_count),
+                updates=tuple(updates),
+            )
+        )
+
+    if file_cursor != len(files):
+        return None
+    stats["disk_load_seconds"] = float(time.perf_counter() - started)
+    stats["build_seconds"] = stats["disk_load_seconds"]
+    payload = {
+        **stats,
+        "tensor_gb": float(stats["tensor_bytes"]) / (1024 ** 3),
+        "gpu_tensor_gb": float(stats["gpu_tensor_bytes"]) / (1024 ** 3),
+        "cpu_tensor_gb": float(stats["cpu_tensor_bytes"]) / (1024 ** 3),
+        "reserve_gb": float(config.gpu_batch_cache_reserve_gb),
+        "groups": len(groups),
+    }
+    print(
+        "FARMOS_GPU_BATCH_CACHE="
+        + json.dumps(payload, sort_keys=True),
+        flush=True,
+    )
+    return tuple(groups), stats
+
+
 def _prepare_gpu_batch_cache(
     model,
     dataset,
     config,
     device,
     strategy_manifest: StrategyManifest | None,
+    *,
+    dataset_sha: str | None = None,
+    effective_action_sha: str | None = None,
 ):
     if not bool(config.gpu_batch_cache):
         return None, {
@@ -1175,6 +1444,18 @@ def _prepare_gpu_batch_cache(
             "transfer_seconds": 0.0,
             "build_seconds": 0.0,
         }
+
+    disk_loaded = _try_load_gpu_batch_disk_cache(
+        dataset,
+        config,
+        device,
+        strategy_manifest,
+        dataset_sha=dataset_sha,
+        effective_action_sha=effective_action_sha,
+    )
+    if disk_loaded is not None:
+        return disk_loaded
+
     started = time.perf_counter()
     device = torch.device(device)
     reserve_bytes = int(
@@ -1196,7 +1477,23 @@ def _prepare_gpu_batch_cache(
         "ledger_seconds": 0.0,
         "transfer_seconds": 0.0,
         "build_seconds": 0.0,
+        "disk_cache_hit": False,
+        "disk_write_seconds": 0.0,
     }
+    disk_cache_root = None
+    disk_cache_identity = None
+    disk_cache_files: list[str] = []
+    if bool(config.gpu_batch_cache_disk) and dataset_sha:
+        disk_cache_root, disk_cache_identity = (
+            _gpu_batch_disk_cache_identity(
+                config,
+                dataset_sha=dataset_sha,
+                effective_action_sha=effective_action_sha,
+                strategy_manifest=strategy_manifest,
+            )
+        )
+        disk_cache_root.mkdir(parents=True, exist_ok=True)
+        stats["disk_cache_dir"] = str(disk_cache_root)
 
     for episodes in _episode_groups(
         dataset,
@@ -1204,6 +1501,7 @@ def _prepare_gpu_batch_cache(
         config.seed,
         0,
     ):
+        group_index = len(groups)
         chunks_by_slot = [
             _episode_chunks(ep, config.sequence_len)
             for ep in episodes
@@ -1269,6 +1567,29 @@ def _prepare_gpu_batch_cache(
                     + _tensor_bytes(ledger)
                     + _tensor_bytes(strategy_slots)
                 )
+                if disk_cache_root is not None:
+                    file_name = (
+                        f"group_{group_index:03d}_"
+                        f"update_{chunk_index:03d}.pt"
+                    )
+                    cache_path = disk_cache_root / file_name
+                    temp_path = cache_path.with_suffix(".tmp")
+                    disk_started = time.perf_counter()
+                    torch.save({
+                        "slots": tuple(slot for slot, _ in active),
+                        "steps": int(steps),
+                        "flat": flat,
+                        "targets": targets,
+                        "ledger": ledger,
+                        "strategy_slots": strategy_slots,
+                        "tensor_bytes": int(tensor_bytes),
+                    }, temp_path)
+                    temp_path.replace(cache_path)
+                    stats["disk_write_seconds"] += float(
+                        time.perf_counter() - disk_started
+                    )
+                    disk_cache_files.append(file_name)
+
                 resident_on_device = False
                 transfer_started = time.perf_counter()
 
@@ -1382,6 +1703,23 @@ def _prepare_gpu_batch_cache(
         ))
 
     stats["build_seconds"] = float(time.perf_counter() - started)
+    if disk_cache_root is not None and disk_cache_identity is not None:
+        manifest_payload = {
+            "complete": True,
+            "identity": disk_cache_identity,
+            "core_window": int(getattr(model.core, "window", 0)),
+            "files": list(disk_cache_files),
+            "tensor_bytes": int(stats["tensor_bytes"]),
+            "cached_updates": int(stats["cached_updates"]),
+            "fallback_updates": int(stats["fallback_updates"]),
+        }
+        manifest_path = disk_cache_root / "manifest.json"
+        temp_manifest = disk_cache_root / "manifest.tmp"
+        temp_manifest.write_text(
+            json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temp_manifest.replace(manifest_path)
     payload = {
         **stats,
         "tensor_gb": float(stats["tensor_bytes"]) / (1024 ** 3),
@@ -1543,11 +1881,15 @@ def _finish_optimizer_step(
     if amp_enabled:
         if scaler is None:
             raise RuntimeError("AMP training requires a GradScaler")
-        # GradScaler owns overflow detection. Avoid .item()/get_scale() here:
-        # both force a CUDA->CPU synchronization on every optimizer step.
+        # There are only a few dozen optimizer updates per epoch, so a
+        # per-update scale/norm check is cheap and prevents silent corruption.
+        scale_before = float(scaler.get_scale())
         scaler.step(optimizer)
         scaler.update()
-        return norm_tensor.detach(), True, None, None
+        scale_after = float(scaler.get_scale())
+        norm_value = float(norm_tensor.detach().float().cpu())
+        finite = math.isfinite(norm_value) and scale_after >= scale_before
+        return norm_value, finite, scale_before, scale_after
 
     finite = bool(torch.isfinite(norm_tensor).item())
     if not finite:
@@ -1709,11 +2051,54 @@ def _train_epoch(
                     conditioning_rng=conditioning_rng,
                     gpu_tensor_training=bool(config.gpu_tensor_training),
                 )
-            if (
-                not amp_enabled
-                and not bool(torch.isfinite(losses["total"]).item())
-            ):
-                raise RuntimeError("non-finite v3 BC loss")
+            loss_snapshot = {
+                key: float(value.detach().float().cpu())
+                for key, value in losses.items()
+            }
+            nonfinite_losses = sorted(
+                key
+                for key, value in loss_snapshot.items()
+                if not math.isfinite(value)
+            )
+            if nonfinite_losses:
+                recurrent_stats["nonfinite_loss_skips"] += 1
+                skip_count = int(
+                    recurrent_stats["nonfinite_loss_skips"]
+                )
+                optimizer.zero_grad(set_to_none=True)
+                for slot, _ in active:
+                    states[slot] = None
+                scale_before = None
+                scale_after = None
+                if amp_enabled and scaler is not None:
+                    scale_before = float(scaler.get_scale())
+                    scale_after = scale_before
+                print(
+                    "V3_BC_NONFINITE_LOSS="
+                    + json.dumps({
+                        "epoch": int(epoch),
+                        "train_steps": int(train_steps),
+                        "components": nonfinite_losses,
+                        "losses": {
+                            key: (
+                                value
+                                if math.isfinite(value)
+                                else str(value)
+                            )
+                            for key, value in loss_snapshot.items()
+                        },
+                        "amp_scale_before": scale_before,
+                        "amp_scale_after": scale_after,
+                        "skip_count": skip_count,
+                    }, sort_keys=True),
+                    flush=True,
+                )
+                if skip_count > 3:
+                    raise RuntimeError(
+                        "repeated non-finite v3 BC loss: "
+                        + ",".join(nonfinite_losses)
+                    )
+                continue
             if amp_enabled:
                 if scaler is None:
                     raise RuntimeError("AMP training requires a GradScaler")
@@ -1765,16 +2150,9 @@ def _train_epoch(
             ):
                 metric_row = _float_dict(detached_losses)
                 loss_ema_value = float(loss_ema.detach().cpu())
-                if not math.isfinite(float(metric_row["total"])):
-                    raise RuntimeError("non-finite v3 BC loss")
                 current_amp_scale = None
                 if amp_enabled and scaler is not None:
                     current_amp_scale = float(scaler.get_scale())
-                    if (
-                        last_logged_amp_scale is not None
-                        and current_amp_scale < last_logged_amp_scale
-                    ):
-                        recurrent_stats["amp_overflow_skips"] += 1
                     last_logged_amp_scale = current_amp_scale
                 elapsed = max(time.perf_counter() - epoch_started, 1e-9)
                 epoch_step = int(train_steps) - epoch_start_steps
@@ -1815,6 +2193,9 @@ def _train_epoch(
                     "amp": bool(amp_enabled),
                     "amp_scale": current_amp_scale,
                     "amp_overflow_skips": int(recurrent_stats["amp_overflow_skips"]),
+                    "nonfinite_loss_skips": int(
+                        recurrent_stats["nonfinite_loss_skips"]
+                    ),
                     "gpu_tensor_training": bool(config.gpu_tensor_training),
                     "tensor_sequence_chunks": int(
                         recurrent_stats.get("tensor_sequence_chunks", 0)
@@ -2768,6 +3149,12 @@ def run_v3_bc(
             config,
             device,
             strategy_manifest,
+            dataset_sha=dataset_sha,
+            effective_action_sha=(
+                None
+                if effective_action_info is None
+                else str(effective_action_info.get("sha256"))
+            ),
         )
     )
     cached_updates_per_epoch = None
@@ -2833,6 +3220,7 @@ def run_v3_bc(
         "recovery_updates": 0,
         "recovery_temporal_steps": 0,
         "amp_overflow_skips": 0,
+        "nonfinite_loss_skips": 0,
         "optimizer_fused": bool(optimizer_fused),
         "scratch_init": bool(scratch_init),
         "dagger_rounds": 0,

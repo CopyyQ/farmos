@@ -132,8 +132,20 @@ class TemporalIntentPolicyV33(TemporalIntentPolicyV32):
             features = ref.new_tensor(
                 economic_market_features_from_shadow_ledger(ledger)
             )
-        continue_residual = self.economic_continue_head(features)
-        active_residual = self.economic_active_head(features)
+        # Economic residuals are numerically sensitive during scratch
+        # training. Keep these tiny heads in FP32 even when the main decoder
+        # runs under CUDA autocast.
+        with torch.autocast(
+            device_type=ref.device.type,
+            enabled=False,
+        ):
+            features_fp32 = features.float()
+            continue_residual = self.economic_continue_head(
+                features_fp32
+            )
+            active_residual = self.economic_active_head(
+                features_fp32
+            )
         scale = float(ECONOMIC_MARKET_SCALE)
         return (
             scale * continue_residual,
@@ -141,14 +153,23 @@ class TemporalIntentPolicyV33(TemporalIntentPolicyV32):
         )
 
     def _auxiliary(self, encoded, h: torch.Tensor, intent: torch.Tensor):
-        base = super()._auxiliary(encoded, h, intent)
-        joint = torch.cat([h, intent], dim=-1)
-        return AuxiliaryOutputsV33(
-            effect=base.effect,
-            future_resource=base.future_resource,
-            unit_task=base.unit_task,
-            opponent_effect=base.opponent_effect,
-            terminal_money=base.terminal_money,
-            terminal_margin=base.terminal_margin,
-            short_economic=self.short_economic_head(joint),
-        )
+        # Auxiliary regression is cheap compared with the recurrent decoder.
+        # Run it in FP32 so large scratch-regression errors cannot overflow
+        # FP16 and poison the shared loss.
+        with torch.autocast(
+            device_type=h.device.type,
+            enabled=False,
+        ):
+            h_fp32 = h.float()
+            intent_fp32 = intent.float()
+            joint = torch.cat([h_fp32, intent_fp32], dim=-1)
+            own_unit_ctx = encoded.own_unit_ctx.float()
+            return AuxiliaryOutputsV33(
+                effect=self.effect_head(joint),
+                future_resource=self.future_resource_head(joint),
+                unit_task=self.unit_task_head(own_unit_ctx),
+                opponent_effect=self.opponent_effect_head(joint),
+                terminal_money=self.terminal_money_head(joint).squeeze(-1),
+                terminal_margin=self.terminal_margin_head(joint).squeeze(-1),
+                short_economic=self.short_economic_head(joint),
+            )

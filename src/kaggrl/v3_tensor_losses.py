@@ -69,7 +69,7 @@ def _quantity_loss_per_decision(
         raise ValueError("quantity logits must end in [tokens, vocab]")
     vocab = logits.shape[-1]
     flat_loss = F.cross_entropy(
-        logits.reshape(-1, vocab),
+        logits.float().reshape(-1, vocab),
         targets.reshape(-1),
         reduction="none",
     ).reshape(targets.shape)
@@ -88,7 +88,7 @@ def _unit_semantic_loss(
     # [B,U]
     op_target = targets.unit_op
     op_ce = F.cross_entropy(
-        op_logits.flatten(0, 1),
+        op_logits.float().flatten(0, 1),
         op_target.reshape(-1),
         reduction="none",
     ).reshape(op_target.shape)
@@ -97,12 +97,12 @@ def _unit_semantic_loss(
         names=UNIT_OPS,
         family_weights=family_weights,
         device=op_logits.device,
-        dtype=op_logits.dtype,
+        dtype=op_ce.dtype,
     )
     loss = op_ce * lookup[op_target]
 
     item_ce = F.cross_entropy(
-        item_logits.flatten(0, 1),
+        item_logits.float().flatten(0, 1),
         targets.unit_item.reshape(-1),
         reduction="none",
     ).reshape(op_target.shape)
@@ -146,7 +146,7 @@ def _market_semantic_loss(
     is_stop = market_op.eq(STOP_ID)
     continue_target = (~is_stop).long()
     continue_ce = F.cross_entropy(
-        outputs.market_continue_logits.flatten(0, 1),
+        outputs.market_continue_logits.float().flatten(0, 1),
         continue_target.reshape(-1),
         reduction="none",
     ).reshape(market_op.shape)
@@ -190,7 +190,7 @@ def _market_semantic_loss(
     )
     active_id = active_index_lookup[market_op]
     active_ce = F.cross_entropy(
-        outputs.market_active_logits.flatten(0, 1),
+        outputs.market_active_logits.float().flatten(0, 1),
         active_id.reshape(-1),
         reduction="none",
     ).reshape(market_op.shape)
@@ -233,7 +233,7 @@ def _market_semantic_loss(
     )
 
     item_ce = F.cross_entropy(
-        outputs.market_item_logits.flatten(0, 1),
+        outputs.market_item_logits.float().flatten(0, 1),
         targets.market_item.reshape(-1),
         reduction="none",
     ).reshape(market_op.shape)
@@ -350,11 +350,12 @@ def tensor_total_pretrain_loss(
         raise ValueError("batch.auxiliary_targets is required")
 
     def mse(prediction, name):
+        prediction_fp32 = prediction.float()
         target = aux_targets[name].to(
             device=prediction.device,
-            dtype=prediction.dtype,
+            dtype=torch.float32,
         )
-        return F.mse_loss(prediction, target)
+        return F.mse_loss(prediction_fp32, target)
 
     effect = mse(outputs.aux.effect, "effect")
     future_resource = mse(
@@ -371,10 +372,10 @@ def tensor_total_pretrain_loss(
     )
     unit_target = aux_targets["unit_task"].to(
         device=outputs.aux.unit_task.device,
-        dtype=outputs.aux.unit_task.dtype,
+        dtype=torch.float32,
     )
     per_unit = (
-        outputs.aux.unit_task - unit_target
+        outputs.aux.unit_task.float() - unit_target
     ).square().flatten(2).mean(dim=-1)
     unit_mask = batch.own_unit_mask.to(
         device=per_unit.device,
@@ -548,11 +549,12 @@ def tensor_total_pretrain_loss_sequence(
         raise ValueError("batch.auxiliary_targets is required")
 
     def mse(prediction, name):
+        prediction_fp32 = prediction.float()
         target = aux_targets[name].to(
             device=prediction.device,
-            dtype=prediction.dtype,
+            dtype=torch.float32,
         )
-        return F.mse_loss(prediction, target)
+        return F.mse_loss(prediction_fp32, target)
 
     effect = mse(outputs.aux.effect, "effect")
     future_resource = mse(
@@ -569,10 +571,10 @@ def tensor_total_pretrain_loss_sequence(
     )
     unit_target = aux_targets["unit_task"].to(
         device=outputs.aux.unit_task.device,
-        dtype=outputs.aux.unit_task.dtype,
+        dtype=torch.float32,
     )
     per_unit = (
-        outputs.aux.unit_task - unit_target
+        outputs.aux.unit_task.float() - unit_target
     ).square().flatten(2).mean(dim=-1)
     own_unit_mask = batch.own_unit_mask.to(
         device=per_unit.device,

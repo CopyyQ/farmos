@@ -148,6 +148,36 @@ def test_v33_short_economic_head_receives_value_gradient():
     assert float(grad.abs().sum()) > 0.0
 
 
+
+def test_v33_auxiliary_heads_stay_fp32_under_autocast():
+    torch.manual_seed(33031)
+    model = TemporalIntentPolicyV33(strategy_count=1).train()
+    batch = collate_transitions([
+        _row(money=3000, market=[_hire(), _stop()]),
+    ])
+    with torch.autocast(
+        device_type="cpu",
+        dtype=torch.bfloat16,
+        enabled=True,
+    ):
+        output = model.teacher_step(
+            batch,
+            batch.canonical_actions,
+            None,
+            strategy_slots=torch.tensor([0], dtype=torch.long),
+        )
+
+    assert output.aux.effect.dtype == torch.float32
+    assert output.aux.future_resource.dtype == torch.float32
+    assert output.aux.unit_task.dtype == torch.float32
+    assert output.aux.opponent_effect.dtype == torch.float32
+    assert output.aux.terminal_money.dtype == torch.float32
+    assert output.aux.terminal_margin.dtype == torch.float32
+    assert output.aux.short_economic.dtype == torch.float32
+    assert output.rows[0].market[0].continue_logits.dtype == torch.float32
+    assert output.rows[0].market[0].op_logits.dtype == torch.float32
+
+
 def test_v33_strategy_recovery_update_changes_economic_heads():
     from types import SimpleNamespace
     from kaggrl.v2_training_data import SequenceChunk
