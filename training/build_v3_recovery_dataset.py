@@ -348,6 +348,7 @@ class _RecoveryCollectingAgent:
         self, candidate, teacher, seat, episode_id, teacher_version, model_sha,
         *, teacher_id="starter", supervision_kind="smoke_only",
         strategy_slot: int | None = None,
+        drop_projected_labels: bool = False,
     ):
         self.candidate = candidate
         self.teacher = teacher
@@ -360,10 +361,12 @@ class _RecoveryCollectingAgent:
         self.strategy_slot = (
             None if strategy_slot is None else int(strategy_slot)
         )
+        self.drop_projected_labels = bool(drop_projected_labels)
         self.rows: list[dict[str, Any]] = []
         self.label_errors: list[dict[str, Any]] = []
         self.projection_corrections = 0
         self.projected_rows = 0
+        self.dropped_projected_rows = 0
 
     def _record_label_error(self, stage: str, observation, error: Exception) -> None:
         obs_plain = _plain(observation)
@@ -416,6 +419,9 @@ class _RecoveryCollectingAgent:
             return learner_action
         self.projection_corrections += int(corrections)
         self.projected_rows += int(corrections > 0)
+        if self.drop_projected_labels and int(corrections) > 0:
+            self.dropped_projected_rows += 1
+            return learner_action
 
         row = {
             "episode_id": self.episode_id,
@@ -556,6 +562,7 @@ def collect_v45_recovery(
     label_errors: list[dict[str, Any]] = []
     projection_corrections = 0
     projected_rows = 0
+    dropped_projected_rows = 0
 
     for seed in seed_list:
         for seat in (0, 1):
@@ -589,6 +596,10 @@ def collect_v45_recovery(
                 teacher_id="v45",
                 supervision_kind="accepted_policy",
                 strategy_slot=resolved_slot,
+                # v45 is a route policy, not an oracle on arbitrary learner
+                # states. If its request must be projected to PASS/NOP/clip,
+                # using the projected action as a target teaches collapse.
+                drop_projected_labels=True,
             )
             agents = (
                 [collector, str(v45_path)]
@@ -602,6 +613,9 @@ def collect_v45_recovery(
                 collector.projection_corrections
             )
             projected_rows += int(collector.projected_rows)
+            dropped_projected_rows += int(
+                collector.dropped_projected_rows
+            )
             for item in collector.label_errors:
                 label_errors.append({
                     "seed": int(seed),
@@ -636,6 +650,7 @@ def collect_v45_recovery(
         "games": len(seed_list) * 2,
         "accepted_rows": len(rows),
         "projected_rows": int(projected_rows),
+        "dropped_projected_rows": int(dropped_projected_rows),
         "projection_corrections": int(projection_corrections),
         "label_error_count": len(label_errors),
         "label_errors": label_errors[:200],
@@ -675,7 +690,11 @@ def collect_v45_recovery(
         "games": len(seed_list) * 2,
         "rows": len(rows),
         "projected_rows": int(projected_rows),
+        "dropped_projected_rows": int(dropped_projected_rows),
         "projection_corrections": int(projection_corrections),
+        "projection_acceptance_rate": float(
+            len(rows) / max(len(rows) + dropped_projected_rows, 1)
+        ),
         "label_error_count": len(label_errors),
         "label_error_report": (
             str(error_path) if label_errors else None

@@ -150,6 +150,40 @@ def test_dagger_projects_invalid_teacher_requests_to_effective_noops():
     assert collector.projection_corrections >= 2
 
 
+
+def test_dagger_can_drop_projected_teacher_labels():
+    obs = _observation()
+    obs["farms"][0]["farmer"] = [0, 0]
+    candidate = _Candidate()
+
+    def teacher(observation, configuration=None):
+        del observation, configuration
+        return {
+            "farmer": ["WEST"],
+            "hands": [],
+            "market": [["SELL", "WHEAT", 100]],
+        }
+
+    collector = _RecoveryCollectingAgent(
+        candidate,
+        teacher,
+        seat=0,
+        episode_id=790,
+        teacher_version="v45-test",
+        model_sha="e" * 64,
+        teacher_id="v45",
+        supervision_kind="accepted_policy",
+        strategy_slot=0,
+        drop_projected_labels=True,
+    )
+    learner_action = collector(obs, configuration={})
+    assert learner_action["farmer"] == ["NORTH"]
+    assert collector.rows == []
+    assert collector.projected_rows == 1
+    assert collector.dropped_projected_rows == 1
+    assert collector.projection_corrections >= 2
+
+
 def test_dagger_teacher_failure_does_not_interrupt_learner_rollout():
     candidate = _Candidate()
 

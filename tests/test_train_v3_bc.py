@@ -413,6 +413,28 @@ def test_training_family_counts_are_scoped_by_unit_and_market(tmp_path):
     assert sum(counts["market"].values()) > 0
 
 
+
+def test_recovery_chunks_reset_temporal_state_across_step_gaps():
+    from training.train_v3_bc import _recovery_chunks
+
+    rows = [
+        {"episode_id": 7, "seat": 0, "step": 0},
+        {"episode_id": 7, "seat": 0, "step": 1},
+        {"episode_id": 7, "seat": 0, "step": 5},
+        {"episode_id": 7, "seat": 0, "step": 6},
+        {"episode_id": 7, "seat": 0, "step": 7},
+    ]
+    chunks = _recovery_chunks(rows, sequence_len=2)
+
+    assert [tuple(int(row["step"]) for row in chunk.rows) for chunk in chunks] == [
+        (0, 1),
+        (5, 6),
+        (7,),
+    ]
+    assert [chunk.episode_start for chunk in chunks] == [True, True, False]
+    assert [chunk.episode_end for chunk in chunks] == [True, False, True]
+
+
 def test_v3_bc_teacher_mix_schedule_is_opt_in_and_validated():
     field = BCV3Config.__dataclass_fields__["teacher_mix_schedule"]
     assert field.default == (1.0,)

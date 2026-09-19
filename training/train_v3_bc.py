@@ -1745,11 +1745,30 @@ def _recovery_chunks(rows, sequence_len):
     chunks = []
     for key in sorted(grouped):
         ordered = sorted(grouped[key], key=lambda item: int(item["step"]))
-        for start in range(0, len(ordered), sequence_len):
-            part = tuple(ordered[start:start + sequence_len])
-            chunks.append(SequenceChunk(
-                key[0], key[1], part, start == 0, start + sequence_len >= len(ordered),
-            ))
+        contiguous_runs = []
+        current = []
+        previous_step = None
+        for row in ordered:
+            step = int(row["step"])
+            if previous_step is not None and step != previous_step + 1:
+                if current:
+                    contiguous_runs.append(current)
+                current = []
+            current.append(row)
+            previous_step = step
+        if current:
+            contiguous_runs.append(current)
+
+        for run in contiguous_runs:
+            for start in range(0, len(run), sequence_len):
+                part = tuple(run[start:start + sequence_len])
+                chunks.append(SequenceChunk(
+                    key[0],
+                    key[1],
+                    part,
+                    start == 0,
+                    start + sequence_len >= len(run),
+                ))
     if not chunks:
         raise ValueError("recovery dataset produced no chunks")
     return chunks
@@ -2841,6 +2860,14 @@ def _collect_online_dagger_round(
         return recovery_rows_all, None, metadata
 
     round_rows = read_recovery_rows(round_path)
+    round_meta_path = round_path.with_suffix(
+        round_path.suffix + ".meta.json"
+    )
+    round_collection = {}
+    if round_meta_path.is_file():
+        round_collection = json.loads(
+            round_meta_path.read_text(encoding="utf-8")
+        )
     combined_rows = list(recovery_rows_all)
     combined_rows.extend(round_rows)
 
@@ -2855,6 +2882,23 @@ def _collect_online_dagger_round(
         "games": len(seeds) * 2,
         "new_rows": len(round_rows),
         "cumulative_rows": len(combined_rows),
+        "projected_rows": int(
+            round_collection.get("projected_rows", 0) or 0
+        ),
+        "dropped_projected_rows": int(
+            round_collection.get("dropped_projected_rows", 0) or 0
+        ),
+        "projection_corrections": int(
+            round_collection.get("projection_corrections", 0) or 0
+        ),
+        "projection_acceptance_rate": (
+            None
+            if "projection_acceptance_rate" not in round_collection
+            else float(round_collection["projection_acceptance_rate"])
+        ),
+        "label_error_count": int(
+            round_collection.get("label_error_count", 0) or 0
+        ),
         "policy_path": str(policy_path),
         "round_path": str(round_path),
         "cumulative_path": str(cumulative_path),
