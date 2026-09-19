@@ -112,17 +112,33 @@ def _sha256(path: Path) -> str:
 
 
 class _RecoveryCollectingAgent:
-    def __init__(self, candidate, teacher, seat, episode_id, teacher_version, model_sha):
+    def __init__(
+        self, candidate, teacher, seat, episode_id, teacher_version, model_sha,
+        *, teacher_id="starter", supervision_kind="smoke_only",
+        strategy_slot: int | None = None,
+    ):
         self.candidate = candidate
         self.teacher = teacher
         self.seat = int(seat)
         self.episode_id = int(episode_id)
         self.teacher_version = str(teacher_version)
         self.model_sha = str(model_sha)
+        self.teacher_id = str(teacher_id)
+        self.supervision_kind = str(supervision_kind)
+        self.strategy_slot = (
+            None if strategy_slot is None else int(strategy_slot)
+        )
         self.rows: list[dict[str, Any]] = []
 
     def __call__(self, observation, configuration=None):
-        teacher_raw = self.teacher(deepcopy(observation))
+        teacher_obs = deepcopy(observation)
+        try:
+            teacher_raw = self.teacher(teacher_obs, configuration)
+        except TypeError as two_arg_error:
+            try:
+                teacher_raw = self.teacher(teacher_obs)
+            except TypeError:
+                raise two_arg_error
         learner_action = self.candidate(observation, configuration)
         fixture = self.candidate.diagnostic_fixtures[-1]
         obs_plain = _plain(observation)
@@ -137,11 +153,13 @@ class _RecoveryCollectingAgent:
             "previous_effect": deepcopy(fixture.get("previous_effect") or {}),
             "effects": {},
             "final_own_money": 0, "final_margin": 0, "terminal_result": 0,
-            "teacher_id": "starter",
+            "teacher_id": self.teacher_id,
             "teacher_version": self.teacher_version,
-            "supervision_kind": "smoke_only",
+            "supervision_kind": self.supervision_kind,
             "learner_model_sha256": self.model_sha,
         }
+        if self.strategy_slot is not None:
+            row["strategy_slot"] = int(self.strategy_slot)
         validate_recovery_row(row)
         self.rows.append(row)
         return learner_action
@@ -190,6 +208,140 @@ def collect_starter_recovery(model_path: Path, output_path: Path, seeds: Iterabl
     }
     output.with_suffix(output.suffix + ".meta.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return output
+
+
+def _load_submission_callable(path: Path, module_name: str):
+    import importlib.util
+    import sys
+
+    path = Path(path).resolve()
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import teacher submission: {path}")
+    module = importlib.util.module_from_spec(spec)
+    parent = str(path.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    for name in ("agent", "main", "act"):
+        value = getattr(module, name, None)
+        if callable(value):
+            return value
+    raise RuntimeError(
+        f"teacher submission has no callable agent/main/act: {path}"
+    )
+
+
+def _rollout_agent_class(model_path: Path):
+    import numpy as np
+
+    with np.load(model_path, allow_pickle=False) as archive:
+        format_version = int(archive["format_version"])
+    if format_version == 4:
+        from rollout.v3_2_agent_numpy import V32NumpyRolloutAgent
+        return V32NumpyRolloutAgent
+    if format_version == 5:
+        from rollout.v3_3_agent_numpy import V33NumpyRolloutAgent
+        return V33NumpyRolloutAgent
+    raise ValueError(
+        f"v45 DAgger requires V3.2/V3.3 NumPy policy, got format {format_version}"
+    )
+
+
+def collect_v45_recovery(
+    model_path: Path,
+    v45_path: Path,
+    output_path: Path,
+    seeds: Iterable[int],
+    *,
+    episode_steps: int = 720,
+    strategy_slot: int | None = None,
+) -> Path:
+    from kaggle_environments import make
+
+    model_path = Path(model_path)
+    v45_path = Path(v45_path)
+    if not model_path.is_file():
+        raise FileNotFoundError(model_path)
+    if not v45_path.is_file():
+        raise FileNotFoundError(v45_path)
+
+    model_sha = _sha256(model_path)
+    teacher_sha = _sha256(v45_path)
+    teacher_version = f"public_v45:sha256:{teacher_sha}"
+    agent_class = _rollout_agent_class(model_path)
+    seed_list = [int(value) for value in seeds]
+    rows: list[dict[str, Any]] = []
+
+    for seed in seed_list:
+        for seat in (0, 1):
+            env = make(
+                "kaggriculture",
+                configuration={
+                    "seed": int(seed),
+                    "episodeSteps": int(episode_steps),
+                },
+                debug=False,
+            )
+            candidate = agent_class(
+                model_path,
+                seed=int(seed) + 101 + seat,
+                deterministic=True,
+                capture_decision_trace=True,
+                strategy_slot=strategy_slot,
+            )
+            resolved_slot = getattr(candidate, "strategy_slot", strategy_slot)
+            teacher = _load_submission_callable(
+                v45_path,
+                f"farmos_v45_teacher_{seed}_{seat}",
+            )
+            collector = _RecoveryCollectingAgent(
+                candidate,
+                teacher,
+                seat,
+                int(seed) * 10 + seat,
+                teacher_version,
+                model_sha,
+                teacher_id="v45",
+                supervision_kind="accepted_policy",
+                strategy_slot=resolved_slot,
+            )
+            agents = (
+                [collector, str(v45_path)]
+                if seat == 0
+                else [str(v45_path), collector]
+            )
+            env.run(agents)
+            statuses = [str(value.status) for value in env.steps[-1]]
+            if statuses != ["DONE", "DONE"]:
+                raise RuntimeError(
+                    f"v45 DAgger game did not finish: seed={seed} seat={seat} "
+                    f"statuses={statuses}"
+                )
+            rows.extend(collector.rows)
+
+    output = write_recovery_rows(rows, output_path)
+    metadata = {
+        "kind": "v3_v45_dagger_recovery",
+        "teacher_id": "v45",
+        "teacher_version": teacher_version,
+        "teacher_sha256": teacher_sha,
+        "supervision_kind": "accepted_policy",
+        "learner_model_sha256": model_sha,
+        "strategy_slot": (
+            None if strategy_slot is None else int(strategy_slot)
+        ),
+        "seeds": seed_list,
+        "episode_steps": int(episode_steps),
+        "games": len(seed_list) * 2,
+        "rows": len(rows),
+    }
+    output.with_suffix(output.suffix + ".meta.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     return output
 

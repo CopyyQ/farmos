@@ -181,6 +181,17 @@ class V32NumpyPolicy(V3NumpyPolicy):
             self.w["market_active_op_head.weight"],
             self.w["market_active_op_head.bias"],
         )
+        economic_hook = getattr(self, "_economic_market_residual", None)
+        if callable(economic_hook):
+            economic_continue, economic_active = economic_hook(ledger)
+            continue_logits = (
+                np.asarray(continue_logits, np.float32)
+                + np.asarray(economic_continue, np.float32)
+            ).astype(np.float32)
+            active_logits = (
+                np.asarray(active_logits, np.float32)
+                + np.asarray(economic_active, np.float32)
+            ).astype(np.float32)
         if slot == 0 and int(getattr(ledger, "step", 0)) == 0:
             width = len(ACTIVE_MARKET_OPS)
             if strategy_context is None:

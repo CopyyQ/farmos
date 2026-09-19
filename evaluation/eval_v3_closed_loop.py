@@ -59,6 +59,9 @@ def _agent_class_for_model(model_path: Path):
     if format_version == 4:
         from rollout.v3_2_agent_numpy import V32NumpyRolloutAgent
         return V32NumpyRolloutAgent
+    if format_version == 5:
+        from rollout.v3_3_agent_numpy import V33NumpyRolloutAgent
+        return V33NumpyRolloutAgent
     raise ValueError(f"unsupported V3 NumPy format version: {format_version}")
 
 
@@ -206,7 +209,10 @@ builtins.__import__ = _guard
 import numpy as np
 with np.load(sys.argv[1], allow_pickle=False) as archive:
     format_version = int(archive["format_version"])
-if format_version == 4:
+if format_version == 5:
+    from rollout.v3_3_agent_numpy import V33NumpyRolloutAgent
+    agent_cls = V33NumpyRolloutAgent
+elif format_version == 4:
     from rollout.v3_2_agent_numpy import V32NumpyRolloutAgent
     agent_cls = V32NumpyRolloutAgent
 elif format_version == 3:

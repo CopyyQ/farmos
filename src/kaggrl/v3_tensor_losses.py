@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from .constants import ITEM_TO_ID, UNIT_OPS
-from .v2_losses import DEFAULT_LOSS_WEIGHTS
+from .v2_losses import DEFAULT_LOSS_WEIGHTS, OPTIONAL_ECONOMIC_LOSS_WEIGHT
 from .v2_ledger import MARKET_OPS
 from .v3_2_schema import ACTIVE_MARKET_OPS
 from .v3_behavior import behavior_family
@@ -407,6 +407,14 @@ def tensor_total_pretrain_loss(
         float(weights[name]) * result[name]
         for name in DEFAULT_LOSS_WEIGHTS
     )
+    short_economic = getattr(outputs.aux, "short_economic", None)
+    if short_economic is not None and "short_economic" in aux_targets:
+        economic = mse(short_economic, "short_economic")
+        result["economic"] = economic
+        result["total"] = (
+            result["total"]
+            + float(OPTIONAL_ECONOMIC_LOSS_WEIGHT) * economic
+        )
     return result
 
 
@@ -596,4 +604,12 @@ def tensor_total_pretrain_loss_sequence(
         float(weights[name]) * result[name]
         for name in DEFAULT_LOSS_WEIGHTS
     )
+    short_economic = getattr(outputs.aux, "short_economic", None)
+    if short_economic is not None and "short_economic" in aux_targets:
+        economic = mse(short_economic, "short_economic")
+        result["economic"] = economic
+        result["total"] = (
+            result["total"]
+            + float(OPTIONAL_ECONOMIC_LOSS_WEIGHT) * economic
+        )
     return result

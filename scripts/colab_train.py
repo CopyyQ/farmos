@@ -35,6 +35,8 @@ def main() -> None:
     parser.add_argument("--config", default="configs/t4_seq32.json")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--dataset", default=None)
+    parser.add_argument("--init-checkpoint", default=None)
+    parser.add_argument("--recovery-dataset", default=None)
     parser.add_argument("--skip-prepare", action="store_true")
     args = parser.parse_args()
 
@@ -47,13 +49,28 @@ def main() -> None:
     dataset = ROOT / "data/top_tier/live_v2/transitions.parquet"
     stage0 = ROOT / "data/top_tier/live_v2/manifests/STAGE0_ACCEPTED.json"
     stage1 = ROOT / "checkpoints/rl_v2_stage1/STAGE1_ACCEPTED.json"
-    init_checkpoint = ROOT / "assets/v32_smoke_init.pt"
+    init_checkpoint = (
+        Path(args.init_checkpoint).resolve()
+        if args.init_checkpoint
+        else ROOT / "assets/v32_smoke_init.pt"
+    )
+    if not init_checkpoint.is_file():
+        raise FileNotFoundError(init_checkpoint)
     run_name = args.run_name or (
         config_path.stem + "_" + time.strftime("%Y%m%d_%H%M%S")
     )
     output = ROOT / "runs" / run_name
 
     values = load_config(config_path)
+    if args.recovery_dataset:
+        values["recovery_dataset_path"] = str(
+            Path(args.recovery_dataset).resolve()
+        )
+    elif values.get("recovery_dataset_path"):
+        recovery = Path(values["recovery_dataset_path"])
+        if not recovery.is_absolute():
+            recovery = (ROOT / recovery).resolve()
+        values["recovery_dataset_path"] = str(recovery)
     config = BCV3Config(
         dataset_path=dataset,
         stage0_marker=stage0,

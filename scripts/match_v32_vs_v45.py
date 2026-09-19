@@ -5,6 +5,8 @@ import json
 import statistics
 import sys
 import time
+
+import torch
 from collections import defaultdict
 from pathlib import Path
 
@@ -13,9 +15,42 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from kaggrl.v3_2_export import export_v3_2_numpy
-from scripts.test_v32_checkpoint import _load_v32_checkpoint
+from kaggrl.v3_2_model import TemporalIntentPolicyV32
+from kaggrl.v3_2_schema import ARCHITECTURE_VERSION as V32_ARCH
+from kaggrl.v3_3_export import export_v3_3_numpy
+from kaggrl.v3_3_model import TemporalIntentPolicyV33
+from kaggrl.v3_3_schema import ARCHITECTURE_VERSION as V33_ARCH
 
 V45 = ROOT.parent / "source_public" / "extracted_v45" / "main.py"
+
+
+def _load_match_checkpoint(checkpoint: Path):
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    architecture = str(payload.get("architecture_version", ""))
+    manifest = payload.get("strategy_manifest") or {}
+    slot_to_team = tuple(
+        int(value) for value in manifest.get("slot_to_team") or ()
+    )
+    if not slot_to_team:
+        raise RuntimeError("checkpoint has no strategy_manifest.slot_to_team")
+
+    if architecture == V32_ARCH:
+        model = TemporalIntentPolicyV32(
+            strategy_count=len(slot_to_team)
+        ).eval()
+        exporter = export_v3_2_numpy
+    elif architecture == V33_ARCH:
+        model = TemporalIntentPolicyV33(
+            strategy_count=len(slot_to_team)
+        ).eval()
+        exporter = export_v3_3_numpy
+    else:
+        raise RuntimeError(
+            "v45 match requires a V3.2/V3.3 checkpoint, "
+            f"got {architecture!r}"
+        )
+    model.load_state_dict(payload["model_state"], strict=True)
+    return payload, model, slot_to_team, exporter
 
 
 def _parse_seeds(text: str) -> list[int]:
@@ -100,7 +135,9 @@ def match_v32_vs_v45(
         )
 
     seeds = list(seeds or [20260919])
-    payload, model, slot_to_team = _load_v32_checkpoint(checkpoint)
+    payload, model, slot_to_team, exporter = _load_match_checkpoint(
+        checkpoint
+    )
     slot = int(slot)
     if not 0 <= slot < len(slot_to_team):
         raise ValueError(
@@ -122,7 +159,7 @@ def match_v32_vs_v45(
     )
 
     policy_path = output / f"slot_{slot:02d}_policy.npz"
-    export_v3_2_numpy(
+    exporter(
         model,
         policy_path,
         default_strategy_slot=slot,
@@ -216,7 +253,7 @@ def match_v32_vs_v45(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run a V3.2 checkpoint only against public v45."
+        description="Run a V3.2/V3.3 checkpoint only against public v45."
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--slot", type=int, default=0)

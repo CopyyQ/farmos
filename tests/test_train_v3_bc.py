@@ -436,6 +436,145 @@ def test_v32_gpu_tensor_chunk_matches_legacy_at_mix_endpoints(tmp_path, mix):
     )
 
 
+def test_v33_run_migrates_v32_and_uses_strategy_recovery(tmp_path):
+    import hashlib
+    import json
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from dataclasses import replace
+    from test_train_v2_bc import _action, _sha, _state
+    from kaggrl.v3_2_model import TemporalIntentPolicyV32
+    from kaggrl.v3_2_schema import ARCHITECTURE_VERSION as V32_ARCH
+    from kaggrl.v3_3_schema import ARCHITECTURE_VERSION as V33_ARCH
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.build_v3_recovery_dataset import write_recovery_rows
+
+    def sha(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    dataset, stage0, stage1, _ = _fixture(tmp_path)
+    table = pq.read_table(dataset)
+    rows_for_strategy = table.to_pylist()
+    for row in rows_for_strategy:
+        row["team_id"] = 1
+    pq.write_table(pa.Table.from_pylist(rows_for_strategy), dataset)
+
+    stage0_payload = json.loads(Path(stage0).read_text(encoding="utf-8"))
+    stage0_payload["artifacts"]["dataset_sha256"] = sha(dataset)
+    Path(stage0).write_text(
+        json.dumps(stage0_payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    stage1_payload = json.loads(Path(stage1).read_text(encoding="utf-8"))
+    stage1_payload["artifacts"]["stage0_marker_sha256"] = sha(stage0)
+    Path(stage1).write_text(
+        json.dumps(stage1_payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    table = pq.read_table(dataset)
+    source_rows = table.to_pylist()
+    effective_rows = [
+        {
+            "episode_id": int(row["episode_id"]),
+            "seat": int(row["seat"]),
+            "step": int(row["step"]),
+            "split": str(row["split"]),
+            "role": str(row["role"]),
+            "effective_action_json": str(row["canonical_action_json"]),
+        }
+        for row in source_rows
+    ]
+    effective_path = dataset.with_name("effective_actions.parquet")
+    pq.write_table(pa.Table.from_pylist(effective_rows), effective_path)
+
+    corpus = dataset.parent / "manifests" / "trusted_corpus_manifest.json"
+    summary = {
+        "source_dataset_sha256": sha(dataset),
+        "effective_actions_sha256": sha(effective_path),
+        "rows": len(effective_rows),
+        "source_corpus_manifest_sha256": sha(corpus),
+        "verified_replay_files": 1,
+        "builder_code_sha256": "b" * 64,
+        "verified_non_eod_transitions": max(1, len(effective_rows)),
+        "engine_module_version": "unit-test",
+        "engine_source_sha256": "c" * 64,
+    }
+    summary_path = (
+        dataset.parent / "manifests" / "effective_actions_summary.json"
+    )
+    summary_path.write_text(
+        json.dumps(summary, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    manifest = build_strategy_manifest([1])
+    torch.manual_seed(3310)
+    v32 = TemporalIntentPolicyV32(strategy_count=1)
+    init = tmp_path / "v32_epoch1.pt"
+    torch.save({
+        "format_version": 4,
+        "architecture_version": V32_ARCH,
+        "model_state": v32.state_dict(),
+        "dataset_sha256": _sha(dataset),
+        "strategy_manifest": {
+            "slot_to_team": list(manifest.slot_to_team),
+            "sha256": manifest.sha256,
+        },
+        "strategy_manifest_sha256": manifest.sha256,
+    }, init)
+
+    recovery_rows = []
+    for step in range(2):
+        recovery_rows.append({
+            "episode_id": 880,
+            "seat": 0,
+            "step": step,
+            "state": _state(step, 1),
+            "canonical_action": _action(1, step),
+            "previous_action": {},
+            "previous_effect": {},
+            "effects": {},
+            "final_own_money": 0,
+            "final_margin": 0,
+            "terminal_result": 0,
+            "teacher_id": "v45",
+            "teacher_version": "unit-test-v45",
+            "supervision_kind": "accepted_policy",
+            "learner_model_sha256": "d" * 64,
+            "strategy_slot": 0,
+        })
+    recovery = write_recovery_rows(
+        recovery_rows, tmp_path / "v45_recovery.jsonl"
+    )
+
+    output = tmp_path / "checkpoints/v33"
+    config = replace(
+        _config(dataset, stage0, stage1, output),
+        sequence_len=1,
+        batch_sequences=1,
+        max_train_steps=3,
+        model_architecture=V33_ARCH,
+        strategy_conditioning=True,
+        recovery_dataset_path=recovery,
+        recovery_every=3,
+        opening_replay_steps=0,
+    )
+    best = run_v3_bc(config, init)
+    payload = torch.load(best, map_location="cpu", weights_only=False)
+    assert payload["architecture_version"] == V33_ARCH
+    assert payload["recurrent_stats"]["recovery_updates"] == 1
+    assert payload["strategy_manifest_sha256"] == manifest.sha256
+    assert set(payload["migration_new_parameter_keys"]) == {
+        "economic_continue_head.bias",
+        "economic_continue_head.weight",
+        "economic_active_head.bias",
+        "economic_active_head.weight",
+        "short_economic_head.bias",
+        "short_economic_head.weight",
+    }
+
+
 def test_v32_gpu_batch_cache_matches_uncached_tensor_path(tmp_path):
     import numpy as np
     from dataclasses import replace

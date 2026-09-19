@@ -37,6 +37,10 @@ from kaggrl.v3_2_schema import (
     STOP_ID,
     STRATEGY_CORE_SCALE,
 )
+from kaggrl.v3_3_model import TemporalIntentPolicyV33
+from kaggrl.v3_3_schema import (
+    ARCHITECTURE_VERSION as V33_ARCHITECTURE_VERSION,
+)
 from kaggrl.v3_strategy import (
     StrategyManifest, build_strategy_manifest, strategy_slot_for_team,
 )
@@ -153,19 +157,32 @@ class BCV3Config:
             raise ValueError("selection_mode must be 'offline_legacy' or 'last_epoch'")
         if self.validation_profile == "fast" and self.selection_mode != "last_epoch":
             raise ValueError("fast validation requires selection_mode='last_epoch'")
-        if self.model_architecture not in {ARCHITECTURE_VERSION, V32_ARCHITECTURE_VERSION}:
+        if self.model_architecture not in {
+            ARCHITECTURE_VERSION,
+            V32_ARCHITECTURE_VERSION,
+            V33_ARCHITECTURE_VERSION,
+        }:
             raise ValueError("unsupported V3 model_architecture")
-        if self.gpu_tensor_training and self.model_architecture != V32_ARCHITECTURE_VERSION:
-            raise ValueError("gpu_tensor_training currently requires V3.2")
+        if self.gpu_tensor_training and self.model_architecture not in {
+            V32_ARCHITECTURE_VERSION,
+            V33_ARCHITECTURE_VERSION,
+        }:
+            raise ValueError("gpu_tensor_training currently requires V3.2/V3.3")
         if self.gpu_batch_cache and not self.gpu_tensor_training:
             raise ValueError("gpu_batch_cache requires gpu_tensor_training")
         if float(self.gpu_batch_cache_reserve_gb) < 0.5:
             raise ValueError("gpu_batch_cache_reserve_gb must be >= 0.5")
-        if self.model_architecture == V32_ARCHITECTURE_VERSION:
+        if self.model_architecture in {
+            V32_ARCHITECTURE_VERSION,
+            V33_ARCHITECTURE_VERSION,
+        }:
             if not self.strategy_conditioning:
-                raise ValueError("V3.2 requires strategy_conditioning")
-            if self.recovery_dataset_path is not None:
-                raise ValueError("V3.2 R0 does not allow recovery supervision")
+                raise ValueError("V3.2/V3.3 requires strategy_conditioning")
+        if (
+            self.model_architecture == V32_ARCHITECTURE_VERSION
+            and self.recovery_dataset_path is not None
+        ):
+            raise ValueError("V3.2 R0 does not allow recovery supervision")
         if self.recovery_dataset_path is not None and self.recovery_every < 3:
             raise ValueError("recovery_every must preserve an expert-majority schedule")
         if self.family_weight_cap is not None and float(self.family_weight_cap) < 1.0:
@@ -242,7 +259,10 @@ def _config_dict(config: BCV3Config) -> dict[str, Any]:
         value["recovery_dataset_path"] = str(value["recovery_dataset_path"])
     value["selection_weights"] = dict(
         V32_SELECTION_WEIGHTS
-        if config.model_architecture == V32_ARCHITECTURE_VERSION
+        if config.model_architecture in {
+            V32_ARCHITECTURE_VERSION,
+            V33_ARCHITECTURE_VERSION,
+        }
         else SELECTION_WEIGHTS
     )
     return value
@@ -1238,9 +1258,13 @@ def _recovery_chunks(rows, sequence_len):
 
 def _recovery_step_loss(
     output, targets, *, supervision_kind: str, family_weights=None,
+    market_active_op_weights=None,
 ):
     domain = action_loss(
-        output, targets, family_weights=family_weights,
+        output,
+        targets,
+        family_weights=family_weights,
+        market_active_op_weights=market_active_op_weights,
     )
     kind = str(supervision_kind)
     if kind == "smoke_only":
@@ -1252,17 +1276,39 @@ def _recovery_step_loss(
 
 def _recovery_update(
     model, optimizer, chunk, state, config, device, family_weights=None,
+    market_active_op_weights=None,
 ):
     losses = []
     for row in chunk.rows:
         batch = collate_transitions([row])
         move_step_batch(batch, device)
-        output = model.teacher_step(batch, batch.canonical_actions, state)
+        strategy_slots = None
+        if getattr(model, "strategy_embedding", None) is not None:
+            if row.get("strategy_slot") is None:
+                raise ValueError(
+                    "strategy-conditioned recovery row requires strategy_slot"
+                )
+            slot = int(row["strategy_slot"])
+            strategy_count = int(getattr(model, "strategy_count", 0) or 0)
+            if not 0 <= slot < strategy_count:
+                raise ValueError(
+                    f"recovery strategy_slot {slot} outside [0, {strategy_count - 1}]"
+                )
+            strategy_slots = torch.tensor(
+                [slot], dtype=torch.long, device=device,
+            )
+        output = model.teacher_step(
+            batch,
+            batch.canonical_actions,
+            state,
+            strategy_slots=strategy_slots,
+        )
         losses.append(_recovery_step_loss(
             output,
             batch.canonical_actions,
             supervision_kind=row.get("supervision_kind", ""),
             family_weights=family_weights,
+            market_active_op_weights=market_active_op_weights,
         ))
         state = output.temporal_state
     total = torch.stack(losses).mean()
@@ -1372,6 +1418,7 @@ def _train_epoch(
         loss, state = _recovery_update(
             model, optimizer, chunk, state, config, device,
             family_weights=family_weights,
+            market_active_op_weights=market_active_op_weights,
         )
         recovery_states[key] = None if chunk.episode_end else state
         recurrent_stats["recovery_updates"] += 1
@@ -1773,7 +1820,10 @@ def _selection_score(
 ):
     weights = (
         V32_SELECTION_WEIGHTS
-        if model_architecture == V32_ARCHITECTURE_VERSION
+        if model_architecture in {
+            V32_ARCHITECTURE_VERSION,
+            V33_ARCHITECTURE_VERSION,
+        }
         else SELECTION_WEIGHTS
     )
     return float(sum(
@@ -1818,7 +1868,10 @@ def _collapse_report(config, expert, free, gaps, initial_state=None):
         and stop_queue - expert_stop > config.stop_queue_expert_gap
     ):
         failures.append("stop_queue_collapse")
-    if config.model_architecture == V32_ARCHITECTURE_VERSION:
+    if config.model_architecture in {
+        V32_ARCHITECTURE_VERSION,
+        V33_ARCHITECTURE_VERSION,
+    }:
         semantic = free.get("semantic") or {}
         market_hist = hist.get("market") or {}
         buy_predictions = sum(
@@ -1941,17 +1994,25 @@ def _checkpoint_payload(
     return {
         "format_version": FORMAT_VERSION,
         "architecture_version": (
-            V32_ARCHITECTURE_VERSION
-            if config.model_architecture == V32_ARCHITECTURE_VERSION
+            V33_ARCHITECTURE_VERSION
+            if config.model_architecture == V33_ARCHITECTURE_VERSION
             else (
-                STRATEGY_ARCHITECTURE_VERSION if strategy_manifest is not None
-                else ARCHITECTURE_VERSION
+                V32_ARCHITECTURE_VERSION
+                if config.model_architecture == V32_ARCHITECTURE_VERSION
+                else (
+                    STRATEGY_ARCHITECTURE_VERSION
+                    if strategy_manifest is not None
+                    else ARCHITECTURE_VERSION
+                )
             )
         ),
         "migration_new_parameter_keys": list(migration_new_parameter_keys),
         "strategy_core_scale": (
             float(STRATEGY_CORE_SCALE)
-            if config.model_architecture == V32_ARCHITECTURE_VERSION
+            if config.model_architecture in {
+                V32_ARCHITECTURE_VERSION,
+                V33_ARCHITECTURE_VERSION,
+            }
             else None
         ),
         "model_state": model.state_dict(),
@@ -2036,7 +2097,12 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
     init_checkpoint = Path(init_checkpoint)
     initial = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
     init_architecture = initial.get("architecture_version")
-    if config.model_architecture == V32_ARCHITECTURE_VERSION:
+    if config.model_architecture == V33_ARCHITECTURE_VERSION:
+        allowed_init = {
+            V32_ARCHITECTURE_VERSION,
+            V33_ARCHITECTURE_VERSION,
+        }
+    elif config.model_architecture == V32_ARCHITECTURE_VERSION:
         allowed_init = {
             ARCHITECTURE_VERSION,
             STRATEGY_ARCHITECTURE_VERSION,
@@ -2057,7 +2123,10 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
     device = resolve_training_device(config.device)
     effective_action_info = None
     effective_action_path = None
-    if config.model_architecture == V32_ARCHITECTURE_VERSION:
+    if config.model_architecture in {
+        V32_ARCHITECTURE_VERSION,
+        V33_ARCHITECTURE_VERSION,
+    }:
         effective_action_info = verify_effective_action_sidecar(
             config.dataset_path,
         )
@@ -2072,14 +2141,20 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
         config.dataset_path, "train", {"active_best"},
         effective_action_path=effective_action_path,
         require_effective_actions=(
-            config.model_architecture == V32_ARCHITECTURE_VERSION
+            config.model_architecture in {
+                V32_ARCHITECTURE_VERSION,
+                V33_ARCHITECTURE_VERSION,
+            }
         ),
     )
     val_data = V2EpisodeDataset(
         config.dataset_path, "val", {"active_best"},
         effective_action_path=effective_action_path,
         require_effective_actions=(
-            config.model_architecture == V32_ARCHITECTURE_VERSION
+            config.model_architecture in {
+                V32_ARCHITECTURE_VERSION,
+                V33_ARCHITECTURE_VERSION,
+            }
         ),
     )
     market_continue_counts = None
@@ -2092,7 +2167,10 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
         family_weights = compute_domain_family_weights(
             family_counts, float(config.family_weight_cap),
         )
-    if config.model_architecture == V32_ARCHITECTURE_VERSION:
+    if config.model_architecture in {
+        V32_ARCHITECTURE_VERSION,
+        V33_ARCHITECTURE_VERSION,
+    }:
         market_active_op_counts = _training_market_active_counts(train_data)
         market_active_op_weights = _balanced_market_active_op_weights(
             market_active_op_counts,
@@ -2103,12 +2181,44 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
     if config.strategy_conditioning:
         strategy_manifest = _build_training_strategy_manifest(train_data)
         _validate_strategy_coverage(strategy_manifest, val_data)
-        if config.recovery_dataset_path is not None:
-            raise RuntimeError(
-                "strategy-conditioned recovery requires strategy-tagged recovery rows"
-            )
     migration_new_parameter_keys: tuple[str, ...] = ()
-    if config.model_architecture == V32_ARCHITECTURE_VERSION:
+    if config.model_architecture == V33_ARCHITECTURE_VERSION:
+        if strategy_manifest is None:
+            raise RuntimeError("V3.3 requires a strategy manifest")
+        if initial.get("strategy_manifest_sha256") != strategy_manifest.sha256:
+            raise RuntimeError(
+                "strategy manifest mismatch in V3.3 initialization checkpoint"
+            )
+        model = TemporalIntentPolicyV33(
+            strategy_count=strategy_manifest.size,
+        )
+        if init_architecture == V33_ARCHITECTURE_VERSION:
+            model.load_state_dict(initial["model_state"], strict=True)
+        else:
+            incompatible = model.load_state_dict(
+                initial["model_state"], strict=False,
+            )
+            expected_missing = {
+                "economic_continue_head.bias",
+                "economic_continue_head.weight",
+                "economic_active_head.bias",
+                "economic_active_head.weight",
+                "short_economic_head.bias",
+                "short_economic_head.weight",
+            }
+            if (
+                set(incompatible.missing_keys) != expected_missing
+                or incompatible.unexpected_keys
+            ):
+                raise RuntimeError(
+                    "unexpected state mismatch while migrating V3.2 to V3.3: "
+                    f"missing={sorted(incompatible.missing_keys)} "
+                    f"unexpected={sorted(incompatible.unexpected_keys)}"
+                )
+            migration_new_parameter_keys = tuple(
+                sorted(incompatible.missing_keys)
+            )
+    elif config.model_architecture == V32_ARCHITECTURE_VERSION:
         if strategy_manifest is None:
             raise RuntimeError("V3.2 requires a strategy manifest")
         model = TemporalIntentPolicyV32(
@@ -2224,7 +2334,10 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
     opening_rows = (
         _opening_training_rows(train_data)
         if (
-            config.model_architecture == V32_ARCHITECTURE_VERSION
+            config.model_architecture in {
+                V32_ARCHITECTURE_VERSION,
+                V33_ARCHITECTURE_VERSION,
+            }
             and int(config.opening_replay_steps) > 0
         )
         else []
@@ -2235,8 +2348,20 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
     if config.recovery_dataset_path is not None:
         recovery_path = Path(config.recovery_dataset_path)
         recovery_dataset_sha = _sha256(recovery_path)
+        recovery_rows = read_recovery_rows(recovery_path)
+        if strategy_manifest is not None:
+            for row in recovery_rows:
+                if row.get("strategy_slot") is None:
+                    raise ValueError(
+                        "strategy-conditioned recovery requires strategy_slot"
+                    )
+                slot = int(row["strategy_slot"])
+                if not 0 <= slot < strategy_manifest.size:
+                    raise ValueError(
+                        f"recovery strategy_slot {slot} outside manifest"
+                    )
         recovery_chunks = _recovery_chunks(
-            read_recovery_rows(recovery_path), config.sequence_len,
+            recovery_rows, config.sequence_len,
         )
 
     prepared_training_groups, gpu_batch_cache_stats = (
@@ -2346,7 +2471,10 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
                 strategy_manifest=strategy_manifest,
                 seed=config.seed + 3000 * epoch,
             )
-            if config.model_architecture == V32_ARCHITECTURE_VERSION
+            if config.model_architecture in {
+                V32_ARCHITECTURE_VERSION,
+                V33_ARCHITECTURE_VERSION,
+            }
             else None
         )
         if config.validation_profile == "full":

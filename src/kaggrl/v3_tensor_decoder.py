@@ -383,6 +383,13 @@ def teacher_step_tensor(
         )
         continue_logits = model.market_continue_head(candidate_hidden)
         active_logits = model.market_active_op_head(candidate_hidden)
+        economic_hook = getattr(model, "_economic_market_residual", None)
+        if callable(economic_hook):
+            economic_continue, economic_active = economic_hook(
+                ledger, candidate_hidden,
+            )
+            continue_logits = continue_logits + economic_continue
+            active_logits = active_logits + economic_active
         if slot == 0 and strategy_context is not None:
             opening_residual = model.opening_strategy_head(
                 strategy_context
@@ -743,6 +750,13 @@ def teacher_step_tensor_mixed(
         )
         continue_logits = model.market_continue_head(candidate_hidden)
         active_logits = model.market_active_op_head(candidate_hidden)
+        economic_hook = getattr(model, "_economic_market_residual", None)
+        if callable(economic_hook):
+            economic_continue, economic_active = economic_hook(
+                conditioning_ledger, candidate_hidden,
+            )
+            continue_logits = continue_logits + economic_continue
+            active_logits = active_logits + economic_active
         if slot == 0 and strategy_context is not None:
             opening_residual = model.opening_strategy_head(
                 strategy_context

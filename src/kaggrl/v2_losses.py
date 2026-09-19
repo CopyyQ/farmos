@@ -39,6 +39,8 @@ EARLY_MARKET_CONTINUE_WEIGHT = {0: 4.0, 1: 2.0}
 # distinct openings without distorting item/quantity or later-game policy.
 EARLY_MARKET_ACTIVE_WEIGHT = {0: 32.0}
 
+OPTIONAL_ECONOMIC_LOSS_WEIGHT = 0.05
+
 DEFAULT_LOSS_WEIGHTS = {
     "action": 1.0,
     "effect": 0.25,
@@ -472,4 +474,12 @@ def total_pretrain_loss(
         float(weights[name]) * result[name]
         for name in DEFAULT_LOSS_WEIGHTS
     )
+    short_economic = getattr(outputs.aux, "short_economic", None)
+    if short_economic is not None and "short_economic" in targets:
+        economic = _mse(short_economic, targets["short_economic"])
+        result["economic"] = economic
+        result["total"] = (
+            result["total"]
+            + float(OPTIONAL_ECONOMIC_LOSS_WEIGHT) * economic
+        )
     return result

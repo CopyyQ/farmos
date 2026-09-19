@@ -166,6 +166,13 @@ class TemporalIntentPolicyV32(TemporalIntentPolicy):
 
         continue_logits = self.market_continue_head(decoder_hidden)
         active_logits = self.market_active_op_head(decoder_hidden)
+        economic_hook = getattr(self, "_economic_market_residual", None)
+        if callable(economic_hook):
+            economic_continue, economic_active = economic_hook(
+                conditioning_ledger, decoder_hidden,
+            )
+            continue_logits = continue_logits + economic_continue
+            active_logits = active_logits + economic_active
         if slot == 0 and int(getattr(ledger, "step", 0)) == 0:
             width = len(ACTIVE_MARKET_OPS)
             if strategy_context is None or int(strategy_context.numel()) < width:

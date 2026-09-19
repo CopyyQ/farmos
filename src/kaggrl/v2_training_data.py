@@ -11,7 +11,8 @@ import pyarrow.parquet as pq
 import torch
 
 from .v2_dataset import decode_zlib_json
-from .v2_ledger import ShadowLedger
+from .v2_ledger import LAND_PRICES, SEED_COST, ShadowLedger
+from .v3_3_schema import SHORT_ECONOMIC_HORIZONS
 from .v2_tensorize import (
     EFFECT_FEATURES,
     V2Batch as StepBatch,
@@ -384,13 +385,96 @@ def _unit_task_targets(rows: Sequence[dict[str, Any]]) -> list[list[list[float]]
     return [value or [] for value in targets]
 
 
+def _dictish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "__dict__"):
+        return vars(value)
+    return {}
+
+
+def _short_economic_snapshot(row: dict[str, Any]) -> tuple[float, float]:
+    state = _row_state_for_supervision(row)
+    own = _dictish(
+        state.get("own", {}) if isinstance(state, dict)
+        else getattr(state, "own", {})
+    )
+    private = _dictish(
+        state.get("private", {}) if isinstance(state, dict)
+        else getattr(state, "private", {})
+    )
+    market = _dictish(
+        state.get("market", {}) if isinstance(state, dict)
+        else getattr(state, "market", {})
+    )
+    prices = _dictish(market.get("prices") or {})
+    money = float(own.get("money", 0) or 0)
+
+    inventory_value = 0.0
+    shed = _dictish(private.get("shed") or {})
+    for item, amount in shed.items():
+        inventory_value += (
+            max(0.0, float(amount or 0))
+            * max(0.0, float(prices.get(item, 0) or 0))
+        )
+
+    inventories = list(private.get("inventories") or [])
+    for inventory in inventories:
+        for item, amount in _dictish(inventory).items():
+            inventory_value += (
+                max(0.0, float(amount or 0))
+                * max(0.0, float(prices.get(item, 0) or 0))
+            )
+
+    seed_value = 0.0
+    for crop, amount in _dictish(private.get("seeds") or {}).items():
+        seed_value += (
+            max(0.0, float(amount or 0))
+            * max(0.0, float(SEED_COST.get(str(crop), 0) or 0))
+        )
+    land_count = len(own.get("unlocked_quadrants") or [])
+    extra_land = max(0, land_count - 1)
+    land_value = float(sum(LAND_PRICES[:extra_land]))
+    return money, money + inventory_value + seed_value + land_value
+
+
+def _short_economic_targets(
+    rows: Sequence[dict[str, Any]],
+) -> list[list[float]]:
+    snapshots = [_short_economic_snapshot(row) for row in rows]
+    out: list[list[float]] = []
+    total = len(rows)
+    for index, row in enumerate(rows):
+        current_money, current_worth = snapshots[index]
+        values: list[float] = []
+        terminal_money = float(row.get("final_own_money", current_money) or 0)
+        for horizon in SHORT_ECONOMIC_HORIZONS:
+            future_index = index + int(horizon)
+            if future_index < total:
+                future_money, future_worth = snapshots[future_index]
+            else:
+                # The accepted corpus stores final cash but not a terminal
+                # inventory valuation. Use cash for both terminal quantities;
+                # this is conservative and avoids inventing liquidation value.
+                future_money = terminal_money
+                future_worth = terminal_money
+            values.extend([
+                signed_log1p(future_money - current_money),
+                signed_log1p(future_worth - current_worth),
+            ])
+        out.append(values)
+    return out
+
+
 def _attach_auxiliary_targets(rows: list[dict[str, Any]]) -> None:
     future_targets = _future_resource_targets(rows)
+    short_economic_targets = _short_economic_targets(rows)
     unit_targets = _unit_task_targets(rows)
     for index, row in enumerate(rows):
         effect = row.get("effects") or {}
         row["_effect_target"] = _effect_tensor(effect).tolist()
         row["_future_resource_target"] = future_targets[index]
+        row["_short_economic_target"] = short_economic_targets[index]
         row["_opponent_effect_target"] = _opponent_effect_target(effect)
         row["_unit_task_target"] = unit_targets[index]
 
@@ -812,6 +896,9 @@ def collate_v2_sequences(samples: Iterable[EpisodeSequence | SequenceChunk],
     future_resource = torch.tensor(
         [row["_future_resource_target"] for row in flat_rows], dtype=torch.float32
     )
+    short_economic = torch.tensor(
+        [row["_short_economic_target"] for row in flat_rows], dtype=torch.float32
+    )
     opponent_effect = torch.tensor(
         [row["_opponent_effect_target"] for row in flat_rows], dtype=torch.float32
     )
@@ -827,6 +914,7 @@ def collate_v2_sequences(samples: Iterable[EpisodeSequence | SequenceChunk],
     auxiliary_targets = {
         "effect": effect_target,
         "future_resource": future_resource,
+        "short_economic": short_economic,
         "unit_task": unit_task,
         "opponent_effect": opponent_effect,
         "terminal_money": terminal_money_tensor,
