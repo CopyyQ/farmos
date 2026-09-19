@@ -26,5 +26,6 @@
   "amp_growth_interval": 2000,
   "validation_profile": "fast",
   "selection_mode": "last_epoch",
-  "clear_cuda_cache": true
+  "clear_cuda_cache": true,
+  "gpu_tensor_training": true
 }

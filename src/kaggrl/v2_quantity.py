@@ -74,6 +74,35 @@ class QuantityDecoder(nn.Module):
         next_hidden = self.gru(self.embedding(previous_token.long()), hidden)
         return self.output(next_hidden), next_hidden
 
+    def teacher_logits_tensor(
+        self,
+        context: torch.Tensor,
+        targets: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if context.ndim != 2:
+            raise ValueError("quantity context must be [batch, features]")
+        if targets.ndim != 2 or target_mask.shape != targets.shape:
+            raise ValueError("tensor quantity targets/mask must be [batch, steps]")
+        if targets.shape[0] != context.shape[0]:
+            raise ValueError("quantity target batch mismatch")
+        if targets.shape[1] <= 0:
+            raise ValueError("quantity tensor target width must be positive")
+        targets = targets.to(device=context.device, dtype=torch.long)
+        target_mask = target_mask.to(device=context.device, dtype=torch.bool)
+        hidden = self.initial_state(context)
+        previous = torch.full(
+            (context.shape[0],), START_ID, dtype=torch.long, device=context.device
+        )
+        logits_steps = []
+        for step_index in range(targets.shape[1]):
+            logits, next_hidden = self.step(hidden, previous)
+            active = target_mask[:, step_index]
+            logits_steps.append(logits)
+            hidden = torch.where(active.unsqueeze(-1), next_hidden, hidden)
+            previous = torch.where(active, targets[:, step_index], previous)
+        return torch.stack(logits_steps, dim=1), target_mask
+
     def teacher_logits(
         self,
         context: torch.Tensor,

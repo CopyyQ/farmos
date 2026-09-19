@@ -40,6 +40,10 @@ from kaggrl.v3_2_schema import (
 from kaggrl.v3_strategy import (
     StrategyManifest, build_strategy_manifest, strategy_slot_for_team,
 )
+from kaggrl.v3_tensor_decoder import teacher_step_tensor_mixed
+from kaggrl.v3_tensor_ledger import TensorLedger
+from kaggrl.v3_tensor_losses import tensor_total_pretrain_loss
+from kaggrl.v3_tensor_targets import TensorActionTargets
 from training.build_v3_recovery_dataset import read_recovery_rows
 from training.train_v3_pretrain import (
     _detach_states,
@@ -117,6 +121,7 @@ class BCV3Config:
     validation_profile: str = "full"
     selection_mode: str = "offline_legacy"
     clear_cuda_cache: bool = True
+    gpu_tensor_training: bool = False
 
     def validate(self) -> None:
         if self.sequence_len <= 0 or self.batch_sequences <= 0:
@@ -144,6 +149,8 @@ class BCV3Config:
             raise ValueError("fast validation requires selection_mode='last_epoch'")
         if self.model_architecture not in {ARCHITECTURE_VERSION, V32_ARCHITECTURE_VERSION}:
             raise ValueError("unsupported V3 model_architecture")
+        if self.gpu_tensor_training and self.model_architecture != V32_ARCHITECTURE_VERSION:
+            raise ValueError("gpu_tensor_training currently requires V3.2")
         if self.model_architecture == V32_ARCHITECTURE_VERSION:
             if not self.strategy_conditioning:
                 raise ValueError("V3.2 requires strategy_conditioning")
@@ -510,10 +517,31 @@ def _teacher_chunk_cached(
     market_active_op_weights: dict[str, float] | None = None,
     teacher_mix_probability: float = 1.0,
     conditioning_rng=None,
+    gpu_tensor_training: bool = False,
 ):
     chunks = [chunk for _, chunk in active_chunks]
     max_len = max(len(chunk.rows) for chunk in chunks)
     sequence = collate_v2_sequences(chunks, max_len)
+    tensor_targets = None
+    tensor_ledger = None
+    tensor_generator = None
+    if gpu_tensor_training:
+        tensor_targets = TensorActionTargets.from_actions(
+            sequence.flat.canonical_actions,
+            max_units=sequence.flat.own_units.shape[1],
+        ).to(device)
+        tensor_ledger = TensorLedger.from_states(
+            sequence.flat.structured_states,
+            device=device,
+        )
+        seed = 0
+        if conditioning_rng is not None and hasattr(conditioning_rng, "integers"):
+            seed = int(conditioning_rng.integers(0, 2**31 - 1))
+        generator_device = (
+            device.type if isinstance(device, torch.device) else torch.device(device).type
+        )
+        tensor_generator = torch.Generator(device=generator_device)
+        tensor_generator.manual_seed(seed)
     move_step_batch(sequence.flat, device)
     step_losses = []
     for time_index in range(max_len):
@@ -532,16 +560,41 @@ def _teacher_chunk_cached(
                 strategy_manifest, device,
             ) if strategy_manifest is not None else None
         )
-        output = model.teacher_step(
-            batch, batch.canonical_actions, packed,
-            strategy_slots=strategy_slots,
-            teacher_mix_probability=teacher_mix_probability,
-            conditioning_rng=conditioning_rng,
-        )
-        step_losses.append(total_pretrain_loss(
-            output, batch, family_weights=family_weights,
-            market_active_op_weights=market_active_op_weights,
-        ))
+        if gpu_tensor_training:
+            index = torch.tensor(
+                row_indices, dtype=torch.long, device=device,
+            )
+            step_targets = tensor_targets.index_select(index)
+            step_ledger = tensor_ledger.index_select(index)
+            output = teacher_step_tensor_mixed(
+                model,
+                batch,
+                step_targets,
+                step_ledger,
+                packed,
+                strategy_slots=strategy_slots,
+                teacher_mix_probability=teacher_mix_probability,
+                generator=tensor_generator,
+            )
+            step_losses.append(tensor_total_pretrain_loss(
+                output,
+                batch,
+                step_targets,
+                step=step_ledger.step,
+                family_weights=family_weights,
+                market_active_op_weights=market_active_op_weights,
+            ))
+        else:
+            output = model.teacher_step(
+                batch, batch.canonical_actions, packed,
+                strategy_slots=strategy_slots,
+                teacher_mix_probability=teacher_mix_probability,
+                conditioning_rng=conditioning_rng,
+            )
+            step_losses.append(total_pretrain_loss(
+                output, batch, family_weights=family_weights,
+                market_active_op_weights=market_active_op_weights,
+            ))
         _store_state(states, slots, output.temporal_state)
         if recurrent_stats is not None:
             recurrent_stats["temporal_steps"] += len(slots)
@@ -732,6 +785,7 @@ def _train_epoch(
                     market_active_op_weights=market_active_op_weights,
                     teacher_mix_probability=teacher_mix_probability,
                     conditioning_rng=conditioning_rng,
+                    gpu_tensor_training=bool(config.gpu_tensor_training),
                 )
             if not torch.isfinite(losses["total"]):
                 raise RuntimeError("non-finite v3 BC loss")
@@ -796,6 +850,7 @@ def _train_epoch(
                         else None
                     ),
                     "amp_overflow_skips": int(recurrent_stats["amp_overflow_skips"]),
+                    "gpu_tensor_training": bool(config.gpu_tensor_training),
                 }
                 if amp_device_type == "cuda" and torch.cuda.is_available():
                     progress["gpu_memory_mb"] = float(

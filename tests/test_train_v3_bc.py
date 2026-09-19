@@ -384,6 +384,89 @@ def test_teacher_chunk_cached_forwards_teacher_mix_probability(tmp_path):
     assert torch.isfinite(losses["total"])
 
 
+@pytest.mark.parametrize("mix", [1.0, 0.0])
+def test_v32_gpu_tensor_chunk_matches_legacy_at_mix_endpoints(tmp_path, mix):
+    import numpy as np
+    from kaggrl.v2_training_data import V2EpisodeDataset
+    from kaggrl.v3_2_model import TemporalIntentPolicyV32
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.train_v3_bc import _teacher_chunk_cached
+
+    dataset, _, _, _ = _fixture(tmp_path)
+    train = V2EpisodeDataset(dataset, "train", {"active_best"})
+    chunk = next(train.iter_chunks(2))
+    active = [(0, chunk)]
+    manifest = build_strategy_manifest([1])
+
+    torch.manual_seed(771)
+    legacy_model = TemporalIntentPolicyV32(strategy_count=1).eval()
+    tensor_model = TemporalIntentPolicyV32(strategy_count=1).eval()
+    tensor_model.load_state_dict(legacy_model.state_dict())
+
+    legacy, legacy_states = _teacher_chunk_cached(
+        legacy_model,
+        active,
+        [None],
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        teacher_mix_probability=mix,
+        conditioning_rng=np.random.default_rng(123),
+        gpu_tensor_training=False,
+    )
+    tensor, tensor_states = _teacher_chunk_cached(
+        tensor_model,
+        active,
+        [None],
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        teacher_mix_probability=mix,
+        conditioning_rng=np.random.default_rng(123),
+        gpu_tensor_training=True,
+    )
+    assert set(legacy) == set(tensor)
+    for key in legacy:
+        assert torch.allclose(
+            tensor[key], legacy[key], atol=1e-5, rtol=1e-5
+        ), key
+    assert torch.allclose(
+        tensor_states[0].h,
+        legacy_states[0].h,
+        atol=1e-6,
+        rtol=0.0,
+    )
+
+
+def test_v32_gpu_tensor_chunk_backpropagates(tmp_path):
+    import numpy as np
+    from kaggrl.v2_training_data import V2EpisodeDataset
+    from kaggrl.v3_2_model import TemporalIntentPolicyV32
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.train_v3_bc import _teacher_chunk_cached
+
+    dataset, _, _, _ = _fixture(tmp_path)
+    train = V2EpisodeDataset(dataset, "train", {"active_best"})
+    chunk = next(train.iter_chunks(2))
+    model = TemporalIntentPolicyV32(strategy_count=1).train()
+    losses, _ = _teacher_chunk_cached(
+        model,
+        [(0, chunk)],
+        [None],
+        torch.device("cpu"),
+        strategy_manifest=build_strategy_manifest([1]),
+        teacher_mix_probability=0.5,
+        conditioning_rng=np.random.default_rng(321),
+        gpu_tensor_training=True,
+    )
+    losses["total"].backward()
+    grads = [
+        parameter.grad
+        for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    assert grads
+    assert all(torch.isfinite(grad).all() for grad in grads)
+
+
 def test_teacher_mix_probability_uses_epoch_schedule_and_holds_last_value():
     from training.train_v3_bc import _teacher_mix_for_epoch
 
