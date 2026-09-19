@@ -113,6 +113,10 @@ def _assert_core_state_parity(shadow, tensor):
     assert int(tensor.land_count[0].item()) == len(shadow.unlocked_quadrants)
     assert bool(tensor.land_count_uncertain[0].item()) == bool(shadow.land_count_uncertain)
     assert int(tensor.shed_reserved[0].item()) == shadow.shed_reserved
+    for name, item_id in ITEM_TO_ID.items():
+        assert int(tensor.shed_pending_upper[0, item_id].item()) == int(
+            shadow.shed_pending_upper.get(name, 0)
+        ), name
     assert bool(tensor.shed_uncertain[0].item()) == bool(shadow.shed_uncertain)
     assert int(tensor.market_slots_used[0].item()) == shadow.market_slots_used
     assert bool(tensor.market_stopped[0].item()) == bool(shadow.market_stopped)
@@ -220,6 +224,57 @@ def test_tensor_market_legal_matches_shadow_across_resource_states():
         shadow = ShadowLedger.from_state(state)
         tensor = TensorLedger.from_states([state])
         _assert_market_legal_parity(shadow, tensor, 0)
+
+
+
+def test_tensor_market_buy_product_can_feed_later_sell_same_queue():
+    state = _state(money=3000, shed={})
+    shadow = ShadowLedger.from_state(state)
+    tensor = TensorLedger.from_states([state])
+
+    _assert_market_legal_parity(shadow, tensor, 0)
+    shadow.apply_market({
+        "kind": "ORDER",
+        "op": "BUY_PRODUCT",
+        "item": "WHEAT",
+        "quantity": 70,
+    })
+    op_t, item_t, qty_t, known_t = _tensor_market_action(
+        "BUY_PRODUCT", "WHEAT", 70,
+    )
+    tensor.apply_market(
+        op_t, item_t, qty_t, known_executed=known_t,
+    )
+    _assert_core_state_parity(shadow, tensor)
+
+    shadow_mask = shadow.legal_market_mask(1, {})
+    tensor_mask = tensor.legal_market(1)
+    wheat = ITEM_TO_ID["WHEAT"]
+    sell = MARKET_OP_TO_ID["SELL"]
+    assert shadow_mask.allows("SELL", "WHEAT")
+    assert shadow_mask.metadata[
+        "market_quantity_max_by_op_item"
+    ]["SELL"]["WHEAT"] == 70
+    assert bool(tensor_mask.item_mask[0, sell, wheat])
+    assert int(tensor_mask.quantity_max[0, sell, wheat]) == 70
+
+    shadow.apply_market({
+        "kind": "ORDER",
+        "op": "SELL",
+        "item": "WHEAT",
+        "quantity": 70,
+    })
+    op_t, item_t, qty_t, known_t = _tensor_market_action(
+        "SELL", "WHEAT", 70,
+    )
+    tensor.apply_market(
+        op_t, item_t, qty_t, known_executed=known_t,
+    )
+    _assert_core_state_parity(shadow, tensor)
+    assert shadow.shed_pending_upper.get("WHEAT", 0) == 0
+    assert shadow.shed_reserved == 0
+    assert int(tensor.shed_pending_upper[0, wheat]) == 0
+    assert int(tensor.shed_reserved[0]) == 0
 
 
 def test_tensor_market_sequence_matches_shadow_state_and_masks():

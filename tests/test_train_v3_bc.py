@@ -660,6 +660,64 @@ def test_v33_online_dagger_round_is_in_run_and_deterministic(
     assert metadata2["cumulative_rows"] == 2
 
 
+
+def test_v33_online_dagger_empty_round_is_nonfatal(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from kaggrl.v3_3_model import TemporalIntentPolicyV33
+    from kaggrl.v3_3_schema import ARCHITECTURE_VERSION as V33_ARCH
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.build_v3_recovery_dataset import RecoveryCollectionEmptyError
+    import training.train_v3_bc as train_module
+
+    teacher = tmp_path / "v45.py"
+    teacher.write_text("def agent(obs, config=None): return {}\n")
+    config = replace(
+        _config(Path("dataset"), Path("s0"), Path("s1"), tmp_path / "run"),
+        init_mode="scratch",
+        epochs=3,
+        model_architecture=V33_ARCH,
+        strategy_conditioning=True,
+        online_dagger=True,
+        dagger_teacher_path=teacher,
+        dagger_start_epoch=1,
+        dagger_seeds_per_round=1,
+        dagger_seed_base=20270000,
+        dagger_strategy_slot=0,
+    )
+    manifest = build_strategy_manifest([1])
+    model = TemporalIntentPolicyV33(strategy_count=1).eval()
+    report = tmp_path / "dagger-errors.json"
+    report.write_text("{}\n", encoding="utf-8")
+
+    def fake_export(model_arg, path, *, default_strategy_slot):
+        assert model_arg is model
+        Path(path).write_bytes(b"fake-policy")
+        return Path(path)
+
+    def fake_collect(*args, **kwargs):
+        raise RecoveryCollectionEmptyError(
+            "zero labels",
+            report_path=report,
+        )
+
+    monkeypatch.setattr(train_module, "export_v3_3_numpy", fake_export)
+    monkeypatch.setattr(train_module, "collect_v45_recovery", fake_collect)
+
+    rows, cumulative, metadata = train_module._collect_online_dagger_round(
+        model,
+        config,
+        epoch=1,
+        output_dir=tmp_path / "run",
+        strategy_manifest=manifest,
+        recovery_rows_all=[],
+    )
+    assert rows == []
+    assert cumulative is None
+    assert metadata["skipped"] is True
+    assert metadata["new_rows"] == 0
+    assert metadata["error_report"] == str(report)
+
+
 def test_v33_run_migrates_v32_and_uses_strategy_recovery(tmp_path):
     import hashlib
     import json

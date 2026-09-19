@@ -323,7 +323,7 @@ def test_effective_supervision_sees_unit_deposit_before_market_sell():
     assert sell["quantity"] == 1
 
 
-def test_effective_supervision_does_not_spend_uncertain_same_turn_buy_inventory():
+def test_effective_supervision_allows_same_turn_buy_then_sell():
     row = _row(0, inventory=0)
     row["canonical_action"]["market"] = [
         {"kind": "ORDER", "op": "BUY_PRODUCT", "item": "WHEAT", "quantity": 60,
@@ -334,4 +334,7 @@ def test_effective_supervision_does_not_spend_uncertain_same_turn_buy_inventory(
     ]
     batch = collate_transitions([row])
     assert batch.canonical_actions[0]["market"][0]["op"] == "BUY_PRODUCT"
-    assert batch.canonical_actions[0]["market"][1]["kind"] == "NOP_SLOT"
+    sell = batch.canonical_actions[0]["market"][1]
+    assert sell["kind"] == "ORDER"
+    assert sell["op"] == "SELL"
+    assert sell["quantity"] == 60

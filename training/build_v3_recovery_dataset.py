@@ -13,6 +13,12 @@ from kaggrl.v2_ledger import MARKET_OPS, ShadowLedger
 from kaggrl.v2_observation import normalize_observation
 
 
+class RecoveryCollectionEmptyError(RuntimeError):
+    def __init__(self, message: str, *, report_path: Path | None = None):
+        super().__init__(message)
+        self.report_path = report_path
+
+
 def canonicalize_teacher_action(raw_action: dict[str, Any], observation: dict[str, Any]):
     player = int(observation.get("player", 0))
     farms = observation.get("farms") or []
@@ -28,6 +34,201 @@ def canonicalize_teacher_action(raw_action: dict[str, Any], observation: dict[st
 def _market_op(slot: dict[str, Any]) -> str:
     kind = str(slot.get("kind", "ORDER"))
     return kind if kind in {"STOP_QUEUE", "NOP_SLOT"} else str(slot.get("op", "NOP_SLOT"))
+
+
+
+def _nop_market_slot() -> dict[str, Any]:
+    return {
+        "kind": "NOP_SLOT",
+        "op": None,
+        "item": None,
+        "quantity": None,
+        "raw": [],
+    }
+
+
+def _pass_unit() -> dict[str, Any]:
+    return {
+        "op": "PASS",
+        "item": None,
+        "quantity": None,
+        "raw": ["PASS"],
+    }
+
+
+def _project_unit_command(
+    ledger: ShadowLedger,
+    actor: str,
+    command: dict[str, Any],
+) -> dict[str, Any]:
+    op = str(command.get("op", "PASS"))
+    legal = ledger.legal_unit_mask(actor, {})
+    if op not in UNIT_OPS or not bool(legal.ops.get(op, False)):
+        return _pass_unit()
+
+    item = command.get("item")
+    if op in {"PICKUP", "PLACE", "PLANT"}:
+        choices = legal.items.get(op, {})
+        if item is None or not bool(choices.get(str(item), False)):
+            return _pass_unit()
+        item = str(item)
+    else:
+        item = None
+
+    quantity = None
+    if op in {"PICKUP", "PLACE"}:
+        bounds = (
+            legal.metadata.get("unit_quantity_max_by_op_item") or {}
+        ).get(op, {})
+        maximum = max(0, int(bounds.get(item, 0) or 0))
+        try:
+            requested = int(command.get("quantity") or 1)
+        except (TypeError, ValueError):
+            requested = 1
+        quantity = min(max(0, requested), maximum)
+        if quantity <= 0:
+            return _pass_unit()
+
+    raw = [op]
+    if item is not None:
+        raw.append(item)
+    if quantity is not None:
+        raw.append(int(quantity))
+    return {
+        "op": op,
+        "item": item,
+        "quantity": quantity,
+        "raw": raw,
+    }
+
+
+def _project_market_slot(
+    ledger: ShadowLedger,
+    slot_index: int,
+    slot: dict[str, Any],
+) -> dict[str, Any]:
+    op = _market_op(slot)
+    legal = ledger.legal_market_mask(slot_index, {})
+    if op == "STOP_QUEUE":
+        if bool(legal.ops.get("STOP_QUEUE", False)):
+            return {
+                "kind": "STOP_QUEUE",
+                "op": None,
+                "item": None,
+                "quantity": None,
+                "raw": [],
+            }
+        return _nop_market_slot()
+    if op == "NOP_SLOT":
+        return _nop_market_slot()
+    if op not in MARKET_OPS or not bool(legal.ops.get(op, False)):
+        return _nop_market_slot()
+
+    if op in {"HIRE", "BUY_LAND"}:
+        return {
+            "kind": "ORDER",
+            "op": op,
+            "item": None,
+            "quantity": None,
+            "raw": [op],
+        }
+
+    item = slot.get("item")
+    choices = legal.items.get(op, {})
+    if item is None or not bool(choices.get(str(item), False)):
+        return _nop_market_slot()
+    item = str(item)
+    bounds = (
+        legal.metadata.get("market_quantity_max_by_op_item") or {}
+    ).get(op, {})
+    maximum = max(0, int(bounds.get(item, 0) or 0))
+    try:
+        requested = int(slot.get("quantity") or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    quantity = min(max(0, requested), maximum)
+    if quantity <= 0:
+        return _nop_market_slot()
+    return {
+        "kind": "ORDER",
+        "op": op,
+        "item": item,
+        "quantity": int(quantity),
+        "raw": [op, item, int(quantity)],
+    }
+
+
+
+def _unit_semantics(command: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(command.get("op", "PASS")),
+        command.get("item"),
+        command.get("quantity"),
+    )
+
+
+def _market_semantics(slot: dict[str, Any]) -> tuple[Any, ...]:
+    op = _market_op(slot)
+    return (
+        op,
+        None if op in {"STOP_QUEUE", "NOP_SLOT", "HIRE", "BUY_LAND"} else slot.get("item"),
+        None if op in {"STOP_QUEUE", "NOP_SLOT", "HIRE", "BUY_LAND"} else slot.get("quantity"),
+    )
+
+
+def project_teacher_action_to_executable(
+    action: dict[str, Any],
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """Project a teacher request onto actions the engine can execute.
+
+    Kaggriculture silently no-ops many invalid unit/market requests. DAgger
+    supervision should teach the effective action at the learner-visited state,
+    not a route request that is invalid only because the teacher did not visit
+    that state itself.
+    """
+    ledger = ShadowLedger.from_state(state)
+    corrections = 0
+
+    requested_farmer = dict(action.get("farmer") or _pass_unit())
+    farmer = _project_unit_command(
+        ledger, "farmer", requested_farmer,
+    )
+    corrections += int(
+        _unit_semantics(farmer) != _unit_semantics(requested_farmer)
+    )
+    ledger.apply_unit("farmer", farmer)
+
+    hands = []
+    for index, source in enumerate(action.get("hands") or []):
+        requested = dict(source)
+        actor = f"hand:{index}"
+        projected = _project_unit_command(ledger, actor, requested)
+        corrections += int(
+            _unit_semantics(projected) != _unit_semantics(requested)
+        )
+        ledger.apply_unit(actor, projected)
+        hands.append(projected)
+
+    market = []
+    for slot_index, source in enumerate(action.get("market") or []):
+        requested = dict(source)
+        projected = _project_market_slot(
+            ledger, slot_index, requested,
+        )
+        corrections += int(
+            _market_semantics(projected) != _market_semantics(requested)
+        )
+        market.append(projected)
+        ledger.apply_market(projected)
+        if _market_op(projected) == "STOP_QUEUE":
+            break
+
+    return {
+        "farmer": farmer,
+        "hands": hands,
+        "market": market,
+    }, corrections
 
 
 def validate_recovery_row(row: dict[str, Any]) -> bool:
@@ -102,6 +303,37 @@ def _plain(value):
     return value
 
 
+
+
+def _environment_errors(env) -> list[str]:
+    raw = getattr(env, "logs", None)
+    if not raw:
+        return []
+    stack = [raw]
+    errors: list[str] = []
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+        elif value:
+            text = str(value)
+            lowered = text.lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "traceback",
+                    "exception",
+                    "error",
+                    "invalid action",
+                    "timeout",
+                )
+            ):
+                errors.append(text)
+    return errors
+
+
 def _sha256(path: Path) -> str:
     import hashlib
     digest = hashlib.sha256()
@@ -129,26 +361,68 @@ class _RecoveryCollectingAgent:
             None if strategy_slot is None else int(strategy_slot)
         )
         self.rows: list[dict[str, Any]] = []
+        self.label_errors: list[dict[str, Any]] = []
+        self.projection_corrections = 0
+        self.projected_rows = 0
+
+    def _record_label_error(self, stage: str, observation, error: Exception) -> None:
+        obs_plain = _plain(observation)
+        self.label_errors.append({
+            "stage": str(stage),
+            "step": int(obs_plain.get("step", -1)),
+            "player": int(obs_plain.get("player", self.seat)),
+            "error_type": type(error).__name__,
+            "error": str(error),
+        })
 
     def __call__(self, observation, configuration=None):
-        teacher_obs = deepcopy(observation)
-        try:
-            teacher_raw = self.teacher(teacher_obs, configuration)
-        except TypeError as two_arg_error:
-            try:
-                teacher_raw = self.teacher(teacher_obs)
-            except TypeError:
-                raise two_arg_error
+        # Learner rollout is authoritative for DAgger state visitation.
+        # Teacher-label failures must never prevent the learner action from
+        # reaching the environment.
         learner_action = self.candidate(observation, configuration)
         fixture = self.candidate.diagnostic_fixtures[-1]
+        teacher_obs = deepcopy(observation)
+        try:
+            try:
+                teacher_raw = self.teacher(teacher_obs, configuration)
+            except TypeError as two_arg_error:
+                try:
+                    teacher_raw = self.teacher(teacher_obs)
+                except TypeError:
+                    raise two_arg_error
+        except Exception as error:
+            self._record_label_error("teacher_call", observation, error)
+            return learner_action
+
         obs_plain = _plain(observation)
-        canonical = canonicalize_teacher_action(_plain(teacher_raw), obs_plain)
+        try:
+            canonical = canonicalize_teacher_action(
+                _plain(teacher_raw), obs_plain,
+            )
+        except Exception as error:
+            self._record_label_error("canonicalize", observation, error)
+            return learner_action
+
+        structured_state = deepcopy(fixture["structured_state"])
+        try:
+            projected, corrections = project_teacher_action_to_executable(
+                canonical,
+                structured_state,
+            )
+        except Exception as error:
+            self._record_label_error(
+                "project_effective_action", observation, error,
+            )
+            return learner_action
+        self.projection_corrections += int(corrections)
+        self.projected_rows += int(corrections > 0)
+
         row = {
             "episode_id": self.episode_id,
             "seat": self.seat,
             "step": int(fixture["step"]),
-            "state": deepcopy(fixture["structured_state"]),
-            "canonical_action": canonical,
+            "state": structured_state,
+            "canonical_action": projected,
             "previous_action": deepcopy(fixture.get("previous_action") or {}),
             "previous_effect": deepcopy(fixture.get("previous_effect") or {}),
             "effects": {},
@@ -160,7 +434,11 @@ class _RecoveryCollectingAgent:
         }
         if self.strategy_slot is not None:
             row["strategy_slot"] = int(self.strategy_slot)
-        validate_recovery_row(row)
+        try:
+            validate_recovery_row(row)
+        except Exception as error:
+            self._record_label_error("validate_label", observation, error)
+            return learner_action
         self.rows.append(row)
         return learner_action
 
@@ -275,6 +553,9 @@ def collect_v45_recovery(
     agent_class = _rollout_agent_class(model_path)
     seed_list = [int(value) for value in seeds]
     rows: list[dict[str, Any]] = []
+    label_errors: list[dict[str, Any]] = []
+    projection_corrections = 0
+    projected_rows = 0
 
     for seed in seed_list:
         for seat in (0, 1):
@@ -316,12 +597,67 @@ def collect_v45_recovery(
             )
             env.run(agents)
             statuses = [str(value.status) for value in env.steps[-1]]
+            env_errors = _environment_errors(env)
+            projection_corrections += int(
+                collector.projection_corrections
+            )
+            projected_rows += int(collector.projected_rows)
+            for item in collector.label_errors:
+                label_errors.append({
+                    "seed": int(seed),
+                    "seat": int(seat),
+                    **item,
+                })
+            for message in env_errors:
+                label_errors.append({
+                    "seed": int(seed),
+                    "seat": int(seat),
+                    "stage": "environment_callback",
+                    "step": -1,
+                    "player": int(seat),
+                    "error_type": "EnvironmentLog",
+                    "error": str(message),
+                })
             if statuses != ["DONE", "DONE"]:
                 raise RuntimeError(
                     f"v45 DAgger game did not finish: seed={seed} seat={seat} "
                     f"statuses={statuses}"
                 )
             rows.extend(collector.rows)
+
+    error_report = {
+        "kind": "v3_v45_dagger_label_errors",
+        "teacher_id": "v45",
+        "teacher_version": teacher_version,
+        "teacher_sha256": teacher_sha,
+        "learner_model_sha256": model_sha,
+        "seeds": seed_list,
+        "episode_steps": int(episode_steps),
+        "games": len(seed_list) * 2,
+        "accepted_rows": len(rows),
+        "projected_rows": int(projected_rows),
+        "projection_corrections": int(projection_corrections),
+        "label_error_count": len(label_errors),
+        "label_errors": label_errors[:200],
+    }
+    error_path = output_path.with_suffix(output_path.suffix + ".errors.json")
+    if label_errors or not rows:
+        error_path.parent.mkdir(parents=True, exist_ok=True)
+        error_path.write_text(
+            json.dumps(error_report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    if not rows:
+        first = label_errors[0] if label_errors else {}
+        raise RecoveryCollectionEmptyError(
+            "v45 DAgger produced zero accepted labels"
+            + (
+                f"; first_error={first.get('stage')}:{first.get('error')}"
+                if first else ""
+            ),
+            report_path=error_path,
+        )
 
     output = write_recovery_rows(rows, output_path)
     metadata = {
@@ -338,6 +674,12 @@ def collect_v45_recovery(
         "episode_steps": int(episode_steps),
         "games": len(seed_list) * 2,
         "rows": len(rows),
+        "projected_rows": int(projected_rows),
+        "projection_corrections": int(projection_corrections),
+        "label_error_count": len(label_errors),
+        "label_error_report": (
+            str(error_path) if label_errors else None
+        ),
     }
     output.with_suffix(output.suffix + ".meta.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",

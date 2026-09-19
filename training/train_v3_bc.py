@@ -54,6 +54,7 @@ from kaggrl.v3_tensor_losses import (
 )
 from kaggrl.v3_tensor_targets import TensorActionTargets
 from training.build_v3_recovery_dataset import (
+    RecoveryCollectionEmptyError,
     collect_v45_recovery,
     read_recovery_rows,
     write_recovery_rows,
@@ -79,7 +80,7 @@ SELECTION_WEIGHTS = {
     "market_sequence_exact": 0.30,
     "full_joint_step_exact": 0.10,
 }
-GPU_BATCH_CACHE_FORMAT_VERSION = 1
+GPU_BATCH_CACHE_FORMAT_VERSION = 2
 
 V32_SELECTION_WEIGHTS = {
     "farmer_semantic_exact": 0.25,
@@ -2804,14 +2805,41 @@ def _collect_online_dagger_round(
         policy_path,
         default_strategy_slot=slot,
     )
-    collect_v45_recovery(
-        policy_path,
-        teacher_path,
-        round_path,
-        seeds,
-        episode_steps=int(config.dagger_episode_steps),
-        strategy_slot=slot,
-    )
+    try:
+        collect_v45_recovery(
+            policy_path,
+            teacher_path,
+            round_path,
+            seeds,
+            episode_steps=int(config.dagger_episode_steps),
+            strategy_slot=slot,
+        )
+    except RecoveryCollectionEmptyError as error:
+        metadata = {
+            "epoch": int(epoch),
+            "seeds": seeds,
+            "games": len(seeds) * 2,
+            "new_rows": 0,
+            "cumulative_rows": len(recovery_rows_all),
+            "policy_path": str(policy_path),
+            "round_path": None,
+            "cumulative_path": None,
+            "cumulative_sha256": None,
+            "skipped": True,
+            "reason": str(error),
+            "error_report": (
+                None
+                if error.report_path is None
+                else str(error.report_path)
+            ),
+        }
+        print(
+            "FARMOS_DAGGER_ROUND_SKIPPED="
+            + json.dumps(metadata, sort_keys=True),
+            flush=True,
+        )
+        return recovery_rows_all, None, metadata
+
     round_rows = read_recovery_rows(round_path)
     combined_rows = list(recovery_rows_all)
     combined_rows.extend(round_rows)

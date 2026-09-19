@@ -93,6 +93,10 @@ class ShadowLedger:
         # Capacity reserved by market buys whose exact execution is unknown.
         # Reserved units are NOT sellable inventory; they only reduce guaranteed room.
         self.shed_reserved = 0
+        # Upper-bound inventory that may arrive from earlier uncertain market
+        # buys in the same order queue. Engine market orders execute
+        # sequentially, so a later SELL can legally consume these units.
+        self.shed_pending_upper: dict[str, int] = {}
         self.shed_uncertain = False
         self.shed_uncertain_items: set[str] = set()
         self.seeds: dict[str, int] = {}
@@ -433,12 +437,20 @@ class ShadowLedger:
                         )
         for item in PRODUCTS:
             known_available = max(0, int(self.shed.get(item, 0)))
-            # SELL must be legal by construction. Do not sell inventory that only
-            # might exist after an uncertain earlier market transaction.
-            items["SELL"][item] = known_available > 0
-            if known_available > 0:
-                sell_max_by_item[item] = known_available
-                market_quantity_max_by_op_item["SELL"][item] = known_available
+            pending_upper = max(
+                0, int(self.shed_pending_upper.get(item, 0))
+            )
+            possible_available = known_available + pending_upper
+            # Kaggriculture executes market slots sequentially. A prior
+            # BUY_PRODUCT/BUY_ANIMAL can therefore feed a later SELL in the
+            # same queue. The pending portion is only an upper bound because
+            # variable prices/opponent contention may reduce the actual buy.
+            items["SELL"][item] = possible_available > 0
+            if possible_available > 0:
+                sell_max_by_item[item] = possible_available
+                market_quantity_max_by_op_item["SELL"][item] = (
+                    possible_available
+                )
         ops["SELL"] = any(items["SELL"].values())
         if ops["SELL"]:
             uncertain.add("SELL")  # proceeds are quote-dependent; inventory is not
@@ -512,16 +524,40 @@ class ShadowLedger:
         if op == "SELL":
             if item not in PRODUCTS:
                 return
-            available = max(0, int(self.shed.get(item, 0)))
-            if known_executed and n > available:
-                raise RuntimeError(
-                    f"executed SELL exceeds shadow inventory: {item} {n}>{available}"
-                )
-            sold = n if known_executed else min(n, available)
-            if sold <= 0:
+            known_available = max(0, int(self.shed.get(item, 0)))
+            pending_upper = max(
+                0, int(self.shed_pending_upper.get(item, 0))
+            )
+            if known_executed:
+                if n > known_available:
+                    raise RuntimeError(
+                        f"executed SELL exceeds shadow inventory: "
+                        f"{item} {n}>{known_available}"
+                    )
+                known_sold = n
+                pending_used = 0
+            else:
+                known_sold = min(n, known_available)
+                remaining = max(0, n - known_sold)
+                pending_used = min(remaining, pending_upper)
+            possible_sold = known_sold + pending_used
+            if possible_sold <= 0:
                 return
-            self.shed[item] = self.shed.get(item, 0) - sold
-            self.cash_lower_bound += sold  # market price floor is exactly 1
+            self.shed[item] = (
+                self.shed.get(item, 0) - known_sold
+            )
+            if pending_used:
+                left = pending_upper - pending_used
+                if left > 0:
+                    self.shed_pending_upper[item] = left
+                else:
+                    self.shed_pending_upper.pop(item, None)
+                self.shed_reserved = max(
+                    0, int(self.shed_reserved) - pending_used
+                )
+            # Only stock already known to exist gives a guaranteed proceeds
+            # floor. Pending bought stock may never execute.
+            self.cash_lower_bound += known_sold
             self.cash_uncertain = True
             return
         if op == "BUY_SEED":
@@ -568,7 +604,13 @@ class ShadowLedger:
             else:
                 reserve = min(n, room)
                 self.shed_reserved += reserve
-                self.cash_lower_bound = min(self.cash_lower_bound, max(0, cost - 1))
+                if reserve > 0:
+                    self.shed_pending_upper[item] = (
+                        self.shed_pending_upper.get(item, 0) + reserve
+                    )
+                self.cash_lower_bound = min(
+                    self.cash_lower_bound, max(0, cost - 1)
+                )
                 self.cash_uncertain = True
                 self.shed_uncertain = True
                 self.shed_uncertain_items.add(item)
@@ -593,10 +635,19 @@ class ShadowLedger:
                 return
             if self.cash_lower_bound <= 0:
                 return
-            self.shed_reserved += min(n, room)
+            reserve = min(n, room)
+            if not self.cash_uncertain:
+                # Every committed unit costs at least $1.
+                reserve = min(reserve, max(0, self.cash_lower_bound))
+            self.shed_reserved += reserve
+            if reserve > 0:
+                self.shed_pending_upper[item] = (
+                    self.shed_pending_upper.get(item, 0) + reserve
+                )
             # The exact variable-price spend is unknown until the engine
             # commits both players' orders. The only guaranteed post-order
-            # cash floor is zero, so later slots must not spend the old cash.
+            # cash floor is zero, so later fixed-cost buys must not spend the
+            # old balance. A later SELL may still consume the pending stock.
             self.cash_lower_bound = 0
             self.cash_uncertain = True
             self.shed_uncertain = True

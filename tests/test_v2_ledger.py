@@ -203,11 +203,18 @@ def test_effective_buy_product_updates_known_inventory_for_following_sell():
     assert not ledger.legal_market_mask(2, []).allows("SELL", "WHEAT")
 
 
-def test_requested_buy_product_does_not_create_guaranteed_sell_inventory():
+def test_requested_buy_product_creates_pending_sell_upper_bound():
     ledger = ShadowLedger.from_state(_state(money=3000, shed={"WHEAT": 0}))
     ledger.apply_market(["BUY_PRODUCT", "WHEAT", 13])
     assert ledger.shed.get("WHEAT", 0) == 0
-    assert not ledger.legal_market_mask(1, []).allows("SELL", "WHEAT")
+    assert ledger.shed_pending_upper["WHEAT"] == 13
+    mask = ledger.legal_market_mask(1, [])
+    assert mask.allows("SELL", "WHEAT")
+    assert mask.metadata["sell_max_by_item"]["WHEAT"] == 13
+
+    ledger.apply_market(["SELL", "WHEAT", 13])
+    assert ledger.shed_pending_upper.get("WHEAT", 0) == 0
+    assert ledger.shed_reserved == 0
 
 
 def test_effective_sell_rejects_impossible_sidecar_quantity():
@@ -230,7 +237,7 @@ def test_unit_quantity_metadata_tracks_pickup_and_place_limits():
     assert bounds["PLACE"]["WHEAT"] == 5
 
 
-def test_unknown_buy_reserves_capacity_without_creating_sellable_inventory():
+def test_unknown_buy_reserves_capacity_and_allows_later_sell_leg():
     ledger = ShadowLedger.from_state(
         _state(money=3000, shed={"FERTILIZER": 90})
     )
@@ -241,13 +248,15 @@ def test_unknown_buy_reserves_capacity_without_creating_sellable_inventory():
     ledger.apply_market(["BUY_PRODUCT", "WHEAT", 7])
     assert ledger.shed.get("WHEAT", 0) == 0
     assert ledger.shed_reserved == 7
+    assert ledger.shed_pending_upper["WHEAT"] == 7
 
     second = ledger.legal_market_mask(1, [])
     qmax2 = second.metadata["market_quantity_max_by_op_item"]
     assert ledger.cash_lower_bound == 0
     assert not second.allows("BUY_PRODUCT", "WHEAT")
     assert "WHEAT" not in qmax2["BUY_PRODUCT"]
-    assert not second.allows("SELL", "WHEAT")
+    assert second.allows("SELL", "WHEAT")
+    assert qmax2["SELL"]["WHEAT"] == 7
 
 
 def test_fixed_cost_market_quantity_bounds_use_money_and_capacity():

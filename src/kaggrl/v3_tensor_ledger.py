@@ -127,6 +127,7 @@ class TensorLedger:
     land_count_uncertain: torch.Tensor
     shed: torch.Tensor
     shed_reserved: torch.Tensor
+    shed_pending_upper: torch.Tensor
     shed_uncertain: torch.Tensor
     seeds: torch.Tensor
     plant_demand: torch.Tensor
@@ -412,6 +413,7 @@ class TensorLedger:
             land_count_uncertain=zeros_b.clone(),
             shed=shed,
             shed_reserved=zeros_l.clone(),
+            shed_pending_upper=zeros_item_l.clone(),
             shed_uncertain=zeros_b.clone(),
             seeds=seeds,
             plant_demand=zeros_item_l.clone(),
@@ -475,6 +477,7 @@ class TensorLedger:
         land_count_uncertain = zbool(batch)
         shed = zlong(batch, ITEM_CLASSES)
         shed_reserved = zlong(batch)
+        shed_pending_upper = zlong(batch, ITEM_CLASSES)
         shed_uncertain = zbool(batch)
         seeds = zlong(batch, ITEM_CLASSES)
         plant_demand = zlong(batch, ITEM_CLASSES)
@@ -568,7 +571,9 @@ class TensorLedger:
             step=step, day=day, cash=cash, cash_uncertain=cash_uncertain,
             hires_today=hires_today, hire_count_uncertain=hire_count_uncertain,
             land_count=land_count, land_count_uncertain=land_count_uncertain,
-            shed=shed, shed_reserved=shed_reserved, shed_uncertain=shed_uncertain,
+            shed=shed, shed_reserved=shed_reserved,
+            shed_pending_upper=shed_pending_upper,
+            shed_uncertain=shed_uncertain,
             seeds=seeds, plant_demand=plant_demand,
             atomic_plant_blocked=atomic_plant_blocked,
             positions=positions, unit_mask=unit_mask, inventory=inventory,
@@ -843,7 +848,11 @@ class TensorLedger:
         )
         ops[:, MARKET_OP_TO_ID["BUY_PRODUCT"]] = product_allowed.any(dim=1)
         product_ids = self._constant(PRODUCT_IDS)
-        available = self.shed[:, product_ids].clamp_min(0)
+        known_available = self.shed[:, product_ids].clamp_min(0)
+        pending_upper = self.shed_pending_upper[
+            :, product_ids
+        ].clamp_min(0)
+        available = known_available + pending_upper
         sell_allowed = active.unsqueeze(1) & available.gt(0)
         items[:, MARKET_OP_TO_ID["SELL"], product_ids] = sell_allowed
         qmax[:, MARKET_OP_TO_ID["SELL"], product_ids] = torch.where(
@@ -1131,16 +1140,36 @@ class TensorLedger:
         valid_qty = work & quantity.gt(0)
 
         sell = valid_qty & op.eq(MARKET_OP_TO_ID["SELL"])
-        available = self.shed[rows, item].clamp_min(0)
-        sold = torch.where(
-            known, quantity, torch.minimum(quantity, available)
+        known_available = self.shed[rows, item].clamp_min(0)
+        pending_available = self.shed_pending_upper[
+            rows, item
+        ].clamp_min(0)
+        known_sold = torch.where(
+            sell & known,
+            quantity,
+            torch.where(
+                sell,
+                torch.minimum(quantity, known_available),
+                torch.zeros_like(quantity),
+            ),
         )
-        sold = torch.where(
-            sell, sold, torch.zeros_like(sold)
+        remaining = (quantity - known_sold).clamp_min(0)
+        pending_used = torch.where(
+            sell & ~known,
+            torch.minimum(remaining, pending_available),
+            torch.zeros_like(quantity),
         )
-        self.shed[rows, item] -= sold
-        self.cash += sold
-        self.cash_uncertain |= sell & sold.gt(0)
+        self.shed[rows, item] -= known_sold
+        self.shed_pending_upper[
+            rows, item
+        ] -= pending_used
+        self.shed_reserved = (
+            self.shed_reserved - pending_used
+        ).clamp_min(0)
+        self.cash += known_sold
+        self.cash_uncertain |= (
+            sell & (known_sold + pending_used).gt(0)
+        )
 
         buy_seed = valid_qty & op.eq(
             MARKET_OP_TO_ID["BUY_SEED"]
@@ -1240,6 +1269,9 @@ class TensorLedger:
         self.shed_reserved[uncertain] += (
             reserve[uncertain]
         )
+        self.shed_pending_upper[
+            rows[uncertain], item[uncertain]
+        ] += reserve[uncertain]
         self.cash[uncertain] = torch.minimum(
             self.cash[uncertain],
             (cost[uncertain] - 1).clamp_min(0),
@@ -1269,7 +1301,15 @@ class TensorLedger:
             & self.cash.gt(0)
         )
         reserve = torch.minimum(quantity, room)
+        reserve = torch.where(
+            ~self.cash_uncertain,
+            torch.minimum(reserve, self.cash.clamp_min(0)),
+            reserve,
+        )
         self.shed_reserved[normal] += reserve[normal]
+        self.shed_pending_upper[
+            rows[normal], item[normal]
+        ] += reserve[normal]
         self.cash[normal] = 0
         self.cash_uncertain[normal] = True
         self.shed_uncertain[normal] = True
