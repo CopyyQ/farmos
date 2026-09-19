@@ -1,6 +1,8 @@
 import torch
+from dataclasses import fields
 
 from kaggrl.constants import ITEM_TO_ID, PRODUCTS, UNIT_OPS
+from kaggrl.v2_tensorize import collate_transitions
 from kaggrl.v2_ledger import MARKET_OPS, ShadowLedger
 from kaggrl.v3_tensor_ledger import (
     ITEM_CLASSES,
@@ -117,6 +119,95 @@ def _assert_core_state_parity(shadow, tensor):
     for name, item_id in ITEM_TO_ID.items():
         assert int(tensor.shed[0, item_id].item()) == int(shadow.shed.get(name, 0)), name
         assert int(tensor.seeds[0, item_id].item()) == int(shadow.seeds.get(name, 0)), name
+
+
+
+def test_tensor_ledger_from_batch_matches_from_states():
+    state = _state(
+        money=2345,
+        hires=3,
+        shed={"WHEAT": 7, "MILK": 2},
+        inventory={"FERTILIZER": 2, "WHEAT": 5},
+        seeds={"CARROT": 4},
+        hands=2,
+    )
+    state["step"] = 100
+    state["day"] = 4
+    state["own_grid"][1][1] = {
+        "kind": "WEED",
+        "fertilizer_available": True,
+    }
+    state["own_grid"][2][2] = {
+        "kind": "PLANT",
+        "crop": "CARROT",
+        "watered_today": True,
+        "yield_units": 3,
+        "planted_day": 2,
+        "fertilized_until_day": 6,
+    }
+    state["own_grid"][3][3] = {
+        "kind": "PASTURE",
+        "animal": "COW",
+        "fed_today": True,
+        "cared_today": True,
+        "yield_units": 2,
+    }
+    action = {
+        "farmer": {
+            "op": "PASS", "item": None, "quantity": None, "raw": ["PASS"],
+        },
+        "hands": [
+            {"op": "PASS", "item": None, "quantity": None, "raw": ["PASS"]},
+            {"op": "PASS", "item": None, "quantity": None, "raw": ["PASS"]},
+        ],
+        "market": [
+            {
+                "kind": "STOP_QUEUE",
+                "op": None,
+                "item": None,
+                "quantity": None,
+                "raw": [],
+            }
+        ],
+    }
+    batch = collate_transitions([
+        {
+            "episode_id": 1,
+            "seat": 0,
+            "step": 100,
+            "state": state,
+            "canonical_action": action,
+            "previous_action": {},
+            "previous_effect": {},
+            "effects": {},
+        }
+    ])
+    reference = TensorLedger.from_states(batch.structured_states)
+    rebuilt = TensorLedger.from_batch(
+        batch, structured_states=batch.structured_states,
+    )
+
+    for field in fields(reference):
+        left = getattr(reference, field.name)
+        right = getattr(rebuilt, field.name)
+        if torch.is_tensor(left):
+            assert torch.equal(left, right), field.name
+        else:
+            assert left == right, field.name
+
+    for actor_index in range(reference.max_units):
+        ref_legal = reference.legal_unit(actor_index)
+        got_legal = rebuilt.legal_unit(actor_index)
+        assert torch.equal(ref_legal.op_mask, got_legal.op_mask)
+        assert torch.equal(ref_legal.item_mask, got_legal.item_mask)
+        assert torch.equal(ref_legal.quantity_max, got_legal.quantity_max)
+
+    for slot in range(10):
+        ref_market = reference.legal_market(slot)
+        got_market = rebuilt.legal_market(slot)
+        assert torch.equal(ref_market.op_mask, got_market.op_mask)
+        assert torch.equal(ref_market.item_mask, got_market.item_mask)
+        assert torch.equal(ref_market.quantity_max, got_market.quantity_max)
 
 
 def test_tensor_market_legal_matches_shadow_across_resource_states():

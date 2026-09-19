@@ -1058,8 +1058,9 @@ def _teacher_chunk_cached(
             sequence.flat.canonical_actions,
             max_units=sequence.flat.own_units.shape[1],
         ).to(device)
-        tensor_ledger = TensorLedger.from_states(
-            sequence.flat.structured_states,
+        tensor_ledger = TensorLedger.from_batch(
+            sequence.flat,
+            structured_states=sequence.flat.structured_states,
             device=device,
         )
         seed = 0
@@ -1167,6 +1168,11 @@ def _prepare_gpu_batch_cache(
             "tensor_bytes": 0,
             "gpu_tensor_bytes": 0,
             "cpu_tensor_bytes": 0,
+            "built_updates": 0,
+            "collate_seconds": 0.0,
+            "target_seconds": 0.0,
+            "ledger_seconds": 0.0,
+            "transfer_seconds": 0.0,
             "build_seconds": 0.0,
         }
     started = time.perf_counter()
@@ -1184,6 +1190,11 @@ def _prepare_gpu_batch_cache(
         "tensor_bytes": 0,
         "gpu_tensor_bytes": 0,
         "cpu_tensor_bytes": 0,
+        "built_updates": 0,
+        "collate_seconds": 0.0,
+        "target_seconds": 0.0,
+        "ledger_seconds": 0.0,
+        "transfer_seconds": 0.0,
         "build_seconds": 0.0,
     }
 
@@ -1215,19 +1226,32 @@ def _prepare_gpu_batch_cache(
             cached = None
             if cacheable:
                 steps = int(lengths[0])
+                stage_started = time.perf_counter()
                 sequence = collate_v2_sequences(chunks, steps)
+                stats["collate_seconds"] += float(
+                    time.perf_counter() - stage_started
+                )
                 flat_rows = [
                     row
                     for chunk in chunks
                     for row in chunk.rows
                 ]
+                stage_started = time.perf_counter()
                 targets = TensorActionTargets.from_actions(
                     sequence.flat.canonical_actions,
                     max_units=sequence.flat.own_units.shape[1],
                 )
-                ledger = TensorLedger.from_states(
-                    sequence.flat.structured_states,
+                stats["target_seconds"] += float(
+                    time.perf_counter() - stage_started
+                )
+                stage_started = time.perf_counter()
+                ledger = TensorLedger.from_batch(
+                    sequence.flat,
+                    structured_states=sequence.flat.structured_states,
                     device="cpu",
+                )
+                stats["ledger_seconds"] += float(
+                    time.perf_counter() - stage_started
                 )
                 strategy_slots = (
                     _strategy_slots_for_rows(
@@ -1246,6 +1270,7 @@ def _prepare_gpu_batch_cache(
                     + _tensor_bytes(strategy_slots)
                 )
                 resident_on_device = False
+                transfer_started = time.perf_counter()
 
                 if device.type == "cuda" and torch.cuda.is_available():
                     free_bytes, _ = torch.cuda.mem_get_info(device)
@@ -1287,6 +1312,9 @@ def _prepare_gpu_batch_cache(
                             strategy_slots = strategy_slots.pin_memory()
                     except RuntimeError:
                         pass
+                stats["transfer_seconds"] += float(
+                    time.perf_counter() - transfer_started
+                )
 
                 cached = _CachedTensorSequence(
                     slots=tuple(slot for slot, _ in active),
@@ -1312,6 +1340,42 @@ def _prepare_gpu_batch_cache(
                 active=active,
                 cached=cached,
             ))
+            stats["built_updates"] += 1
+            cache_progress_every = max(
+                1, int(getattr(config, "progress_every", 5) or 5)
+            )
+            if (
+                stats["built_updates"] % cache_progress_every == 0
+                or chunk_index + 1 == max_chunks
+            ):
+                print(
+                    "FARMOS_GPU_BATCH_CACHE_PROGRESS="
+                    + json.dumps({
+                        "built_updates": int(stats["built_updates"]),
+                        "group": int(len(groups) + 1),
+                        "group_update": int(chunk_index + 1),
+                        "group_updates": int(max_chunks),
+                        "active_sequences": int(len(active)),
+                        "rows": int(sum(lengths)),
+                        "cached": bool(cached is not None),
+                        "gpu_resident_updates": int(
+                            stats["gpu_resident_updates"]
+                        ),
+                        "cpu_resident_updates": int(
+                            stats["cpu_resident_updates"]
+                        ),
+                        "collate_seconds": float(
+                            stats["collate_seconds"]
+                        ),
+                        "ledger_seconds": float(
+                            stats["ledger_seconds"]
+                        ),
+                        "elapsed_seconds": float(
+                            time.perf_counter() - started
+                        ),
+                    }, sort_keys=True),
+                    flush=True,
+                )
         groups.append(_PreparedTrainingGroup(
             slot_count=len(chunks_by_slot),
             updates=tuple(updates),

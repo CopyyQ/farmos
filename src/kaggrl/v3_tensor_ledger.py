@@ -16,6 +16,13 @@ from .v2_ledger import (
     SEED_COST,
 )
 from .v3_2_schema import ACTIVE_MARKET_OPS
+from .v2_tensorize import (
+    COMMODITY_FEATURE_INDEX,
+    ECONOMY_FEATURE_INDEX,
+    TILE_FEATURE_INDEX,
+    TILE_KINDS,
+    UNIT_FEATURE_INDEX,
+)
 
 ITEM_NAMES = tuple(ITEM_TO_ID)
 ITEM_CLASSES = max(ITEM_TO_ID.values()) + 1
@@ -77,6 +84,11 @@ def _tile_kind(tile: Any) -> int:
 def _signed_log1p_tensor(value: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     value = value.to(dtype)
     return torch.sign(value) * torch.log1p(value.abs())
+
+
+def _inverse_signed_log1p_long(value: torch.Tensor) -> torch.Tensor:
+    decoded = torch.sign(value) * torch.expm1(value.abs())
+    return torch.round(decoded).to(torch.long)
 
 
 def _fib_table(size: int = 64) -> torch.Tensor:
@@ -178,6 +190,254 @@ class TensorLedger:
                 value.index_select(0, index) if torch.is_tensor(value) else value
             )
         return TensorLedger(**values)
+
+    @classmethod
+    def from_batch(
+        cls,
+        batch,
+        *,
+        structured_states=None,
+        device: torch.device | str | None = None,
+    ) -> "TensorLedger":
+        """Build a ledger from tensors already produced by V2 collation.
+
+        Python structured states are consulted only to preserve inventory key
+        order, which can matter for DROP when shed capacity is tight.
+        """
+        source_device = batch.own_grid.device
+        target_device = (
+            source_device if device is None else torch.device(device)
+        )
+        own_grid = batch.own_grid
+        own_units = batch.own_units
+        unit_mask = batch.own_unit_mask.to(torch.bool)
+        commodities = batch.commodities
+        economy = batch.economy
+
+        b, board, _, _ = own_grid.shape
+        max_units = int(own_units.shape[1])
+
+        def econ(name: str) -> torch.Tensor:
+            return economy[:, ECONOMY_FEATURE_INDEX[name]]
+
+        step = _inverse_signed_log1p_long(econ("step_log"))
+        day = _inverse_signed_log1p_long(econ("day_log"))
+        cash = _inverse_signed_log1p_long(econ("own_money"))
+        hires_today = _inverse_signed_log1p_long(
+            econ("own_hires_today")
+        )
+        land_count = _inverse_signed_log1p_long(
+            econ("own_land_count")
+        )
+
+        shed = torch.zeros(
+            (b, ITEM_CLASSES), dtype=torch.long, device=source_device,
+        )
+        seeds = torch.zeros_like(shed)
+        market_prices = torch.zeros_like(shed)
+        for commodity_row, name in enumerate(ITEM_NAMES):
+            item_id = ITEM_TO_ID[name]
+            shed[:, item_id] = _inverse_signed_log1p_long(
+                commodities[
+                    :, commodity_row,
+                    COMMODITY_FEATURE_INDEX["shed_quantity"],
+                ]
+            )
+            seeds[:, item_id] = _inverse_signed_log1p_long(
+                commodities[
+                    :, commodity_row,
+                    COMMODITY_FEATURE_INDEX["seed_quantity"],
+                ]
+            )
+            market_prices[:, item_id] = _inverse_signed_log1p_long(
+                commodities[
+                    :, commodity_row,
+                    COMMODITY_FEATURE_INDEX["market_price"],
+                ]
+            )
+
+        denom = max(1, board - 1)
+        positions = torch.zeros(
+            (b, max_units, 2), dtype=torch.long, device=source_device,
+        )
+        positions[:, :, 0] = torch.round(
+            own_units[:, :, UNIT_FEATURE_INDEX["x"]] * float(denom)
+        ).to(torch.long)
+        positions[:, :, 1] = torch.round(
+            own_units[:, :, UNIT_FEATURE_INDEX["y"]] * float(denom)
+        ).to(torch.long)
+        positions = torch.where(
+            unit_mask.unsqueeze(-1),
+            positions,
+            torch.zeros_like(positions),
+        )
+
+        inventory = torch.zeros(
+            (b, max_units, ITEM_CLASSES),
+            dtype=torch.long,
+            device=source_device,
+        )
+        for name in ITEM_NAMES:
+            item_id = ITEM_TO_ID[name]
+            inventory[:, :, item_id] = _inverse_signed_log1p_long(
+                own_units[
+                    :, :, UNIT_FEATURE_INDEX[f"inventory:{name}"]
+                ]
+            )
+        inventory = torch.where(
+            unit_mask.unsqueeze(-1),
+            inventory,
+            torch.zeros_like(inventory),
+        )
+
+        inventory_order = torch.zeros_like(inventory)
+        states = (
+            tuple(structured_states)
+            if structured_states is not None
+            else tuple(getattr(batch, "structured_states", ()) or ())
+        )
+        if states:
+            if len(states) != b:
+                raise ValueError(
+                    "structured state count does not match tensor batch"
+                )
+            order_rows = []
+            for state in states:
+                units = list(_field(state, "own_units", []) or [])
+                row_order = torch.zeros(
+                    (max_units, ITEM_CLASSES), dtype=torch.long,
+                )
+                for actor_index, unit in enumerate(units[:max_units]):
+                    inv = _mapping(_mapping(unit).get("inventory") or {})
+                    slot = 0
+                    for name, amount in inv.items():
+                        item_id = ITEM_TO_ID.get(str(name))
+                        if (
+                            item_id is not None
+                            and int(amount or 0) > 0
+                            and slot < ITEM_CLASSES
+                        ):
+                            row_order[actor_index, slot] = int(item_id)
+                            slot += 1
+                order_rows.append(row_order)
+            inventory_order = torch.stack(order_rows).to(source_device)
+        else:
+            item_ids = torch.arange(
+                ITEM_CLASSES, device=source_device, dtype=torch.long,
+            ).view(1, 1, -1)
+            present = inventory.gt(0) & item_ids.gt(0)
+            inventory_order = torch.where(
+                present,
+                item_ids.expand_as(inventory),
+                torch.zeros_like(inventory),
+            )
+
+        kind_scores = torch.stack(
+            [
+                own_grid[:, :, :, TILE_FEATURE_INDEX[f"kind:{name}"]]
+                for name in TILE_KINDS
+            ],
+            dim=-1,
+        )
+        grid_kind = kind_scores.argmax(dim=-1).to(torch.long)
+        grid_is_dict = (
+            grid_kind.ne(TILE_KIND_TO_ID["EMPTY"])
+            & grid_kind.ne(TILE_KIND_TO_ID["LOCKED"])
+        )
+
+        grid_crop = torch.zeros(
+            (b, board, board), dtype=torch.long, device=source_device,
+        )
+        for name in CROPS:
+            grid_crop = torch.where(
+                own_grid[
+                    :, :, :, TILE_FEATURE_INDEX[f"crop:{name}"]
+                ].gt(0.5),
+                torch.full_like(grid_crop, ITEM_TO_ID[name]),
+                grid_crop,
+            )
+        grid_animal = torch.zeros_like(grid_crop)
+        for name in ANIMALS:
+            grid_animal = torch.where(
+                own_grid[
+                    :, :, :, TILE_FEATURE_INDEX[f"animal:{name}"]
+                ].gt(0.5),
+                torch.full_like(grid_animal, ITEM_TO_ID[name]),
+                grid_animal,
+            )
+
+        def tile_bool(name: str) -> torch.Tensor:
+            return own_grid[
+                :, :, :, TILE_FEATURE_INDEX[name]
+            ].gt(0.5)
+
+        def tile_long(name: str) -> torch.Tensor:
+            return _inverse_signed_log1p_long(
+                own_grid[:, :, :, TILE_FEATURE_INDEX[name]]
+            )
+
+        grid_yield = tile_long("yield_units")
+        grid_planted_day = tile_long("planted_day")
+        fertilized_raw = own_grid[
+            :, :, :, TILE_FEATURE_INDEX["fertilized_until_day"]
+        ]
+        grid_fertilized_until_day = _inverse_signed_log1p_long(
+            fertilized_raw
+        )
+        grid_fertilized_until_day = torch.where(
+            grid_is_dict & fertilized_raw.ne(0),
+            grid_fertilized_until_day,
+            torch.full_like(grid_fertilized_until_day, -1),
+        )
+
+        zeros_b = torch.zeros(
+            b, dtype=torch.bool, device=source_device,
+        )
+        zeros_l = torch.zeros(
+            b, dtype=torch.long, device=source_device,
+        )
+        zeros_item_l = torch.zeros_like(shed)
+        zeros_item_b = torch.zeros(
+            shed.shape, dtype=torch.bool, device=source_device,
+        )
+
+        ledger = cls(
+            step=step,
+            day=day,
+            cash=cash,
+            cash_uncertain=zeros_b.clone(),
+            hires_today=hires_today,
+            hire_count_uncertain=zeros_b.clone(),
+            land_count=land_count,
+            land_count_uncertain=zeros_b.clone(),
+            shed=shed,
+            shed_reserved=zeros_l.clone(),
+            shed_uncertain=zeros_b.clone(),
+            seeds=seeds,
+            plant_demand=zeros_item_l.clone(),
+            atomic_plant_blocked=zeros_item_b,
+            positions=positions,
+            unit_mask=unit_mask,
+            inventory=inventory,
+            inventory_order=inventory_order,
+            grid_kind=grid_kind,
+            grid_is_dict=grid_is_dict,
+            grid_crop=grid_crop,
+            grid_animal=grid_animal,
+            grid_watered=tile_bool("watered_today"),
+            grid_fed=tile_bool("fed_today"),
+            grid_cared=tile_bool("cared_today"),
+            grid_fertilizer_available=tile_bool(
+                "fertilizer_available"
+            ),
+            grid_yield=grid_yield,
+            grid_planted_day=grid_planted_day,
+            grid_fertilized_until_day=grid_fertilized_until_day,
+            market_prices=market_prices,
+            market_slots_used=zeros_l.clone(),
+            market_stopped=zeros_b.clone(),
+        )
+        return ledger.to(target_device)
 
     @classmethod
     def from_states(cls, states, *, device: torch.device | str = "cpu") -> "TensorLedger":
