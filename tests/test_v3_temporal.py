@@ -108,3 +108,20 @@ def test_ring_buffer_keeps_last_32_tokens_after_33_steps():
     assert ordered.shape == (32, 128)
     assert torch.allclose(ordered[-1], state.memory[0, 0])
     assert torch.isfinite(ordered).all()
+
+
+def test_attention_fp16_masking_and_diagnostics_are_finite():
+    torch.manual_seed(17)
+    core = TemporalCore(window=4).eval().half()
+    state = core.zero_state(2, dtype=torch.float16)
+    state.valid_length[1] = 1
+    state.write_pos[1] = 1
+    state.memory[1, 0, 0] = 1.0
+    token = torch.zeros(2, core.attention_dim, dtype=torch.float16)
+    context, diagnostics = core._attend(token, state)
+    assert context.dtype == torch.float16
+    assert torch.isfinite(context).all()
+    assert diagnostics.attention_weights.dtype == torch.float32
+    assert torch.isfinite(diagnostics.attention_weights).all()
+    assert torch.isfinite(diagnostics.attention_entropy).all()
+    assert torch.isfinite(diagnostics.mean_attended_age).all()

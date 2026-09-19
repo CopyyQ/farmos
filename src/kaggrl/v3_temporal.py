@@ -165,14 +165,21 @@ class TemporalCore(nn.Module):
         empty = ~safe_valid.any(dim=1)
         if empty.any():
             safe_valid[empty, 0] = True
-        scores = scores.masked_fill(~safe_valid.unsqueeze(1), -1e9)
-        weights = torch.softmax(scores, dim=-1)
+        # AMP on T4 produces float16 attention scores. A hard-coded -1e9
+        # cannot be represented by float16 and raises before softmax. Mask with
+        # the minimum finite value for the active dtype, then perform softmax
+        # and diagnostics in float32 for numerical stability.
+        mask_value = torch.finfo(scores.dtype).min
+        scores = scores.masked_fill(~safe_valid.unsqueeze(1), mask_value)
+        weights = torch.softmax(scores.float(), dim=-1)
         if empty.any():
             weights = weights.masked_fill(empty.view(-1, 1, 1), 0.0)
-        context = torch.einsum("bhw,bhwd->bhd", weights, v)
+        context = torch.einsum("bhw,bhwd->bhd", weights.to(v.dtype), v)
         context = context.reshape(context.shape[0], self.attention_dim)
         context = self.o_proj(context)
-        entropy = -(weights * weights.clamp_min(1e-12).log()).sum(dim=-1)
+        entropy = -(
+            weights * weights.clamp_min(torch.finfo(weights.dtype).tiny).log()
+        ).sum(dim=-1)
         mean_age = (
             weights * ages.unsqueeze(1).to(weights.dtype)
         ).sum(dim=-1)

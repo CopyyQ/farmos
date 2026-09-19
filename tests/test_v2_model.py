@@ -193,3 +193,16 @@ def test_teacher_mix_zero_uses_model_semantic_and_model_conditioning_ledger():
     assert farmer.chosen_action["op"] == "EAST"
     assert hand_trace.previous_semantic == "U:PASS"
     assert hand_trace.farmer_position_before == (4, 4)
+
+
+def test_masked_logits_support_float16_without_overflow():
+    logits = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float16)
+    mask = torch.tensor([True, False, True])
+    masked = RecurrentIntentPolicy._masked_logits(logits, mask)
+    assert masked.dtype == torch.float16
+    assert masked[0].item() == 1.0
+    assert masked[2].item() == 3.0
+    assert masked[1].item() == torch.finfo(torch.float16).min
+    probs = torch.softmax(masked.float(), dim=-1)
+    assert torch.isfinite(probs).all()
+    assert probs[1].item() == 0.0

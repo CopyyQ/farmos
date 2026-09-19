@@ -183,14 +183,15 @@ class RecurrentIntentPolicy(nn.Module):
     def _masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         if not bool(mask.any()):
             raise RuntimeError("decoder received an empty legal mask")
-        return logits.masked_fill(~mask, -1e9)
+        # Keep legal masking representable under CUDA AMP/float16.
+        return logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
 
     @staticmethod
     def _choose(logits: torch.Tensor, mask: torch.Tensor, rng, deterministic: bool) -> int:
         masked = RecurrentIntentPolicy._masked_logits(logits, mask)
         if deterministic:
             return int(masked.argmax().item())
-        probs = torch.softmax(masked.detach(), dim=-1).cpu().numpy()
+        probs = torch.softmax(masked.detach().float(), dim=-1).cpu().numpy()
         if rng is not None and hasattr(rng, "choice"):
             return int(rng.choice(len(probs), p=probs))
         return int(torch.multinomial(torch.as_tensor(probs), 1).item())
