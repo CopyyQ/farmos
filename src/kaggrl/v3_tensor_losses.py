@@ -367,7 +367,8 @@ def tensor_total_pretrain_loss(
         sample_weight,
         targets.unit_mask[:, 0],
     )
-    domain_values = [farmer]
+    weighted_domain_values = [4.0 * farmer]
+    active_domain_count = 1
     if targets.max_units > 1:
         hand_mask = targets.unit_mask[:, 1:]
         hand_count = hand_mask.sum(dim=1)
@@ -379,7 +380,8 @@ def tensor_total_pretrain_loss(
             sample_weight,
             hand_count.gt(0),
         )
-        domain_values.append(hands)
+        weighted_domain_values.append(hands)
+        active_domain_count += 1
     else:
         hands = farmer * 0.0
 
@@ -398,8 +400,11 @@ def tensor_total_pretrain_loss(
         market_weights,
         targets.market_mask,
     )
-    domain_values.append(market)
-    action = torch.stack(domain_values).mean()
+    weighted_domain_values.append(2.0 * market)
+    active_domain_count += 1
+    action = torch.stack(weighted_domain_values).sum() / float(
+        active_domain_count
+    )
 
     aux_targets = getattr(batch, "auxiliary_targets", None)
     if not isinstance(aux_targets, dict):
@@ -594,8 +599,8 @@ def tensor_total_pretrain_loss_sequence(
         2.0 + hand_domain_active_t.to(farmer_t.dtype)
     )
     action_t = (
-        farmer_t
-        + market_t
+        4.0 * farmer_t
+        + 2.0 * market_t
         + hands_t * hand_domain_active_t.to(hands_t.dtype)
     ) / domain_count_t
     action = action_t.mean()

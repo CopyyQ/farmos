@@ -368,12 +368,22 @@ def action_loss(
         if any(market_active) else ref.sum() * 0.0
     )
 
-    domains = [farmer]
+    # Preserve the proven top-tier expert emphasis: the main
+    # farmer drives route progression and market decisions drive the
+    # economy. Keep the denominator as the number of active domains so the
+    # hand contribution retains its historical scale while farmer/market
+    # receive 4x/2x gradient emphasis respectively.
+    weighted_domains = [4.0 * farmer]
+    active_domain_count = 1
     if any(hand_active):
-        domains.append(hands)
+        weighted_domains.append(hands)
+        active_domain_count += 1
     if any(market_active):
-        domains.append(market)
-    total = _semantic_mean(domains)
+        weighted_domains.append(2.0 * market)
+        active_domain_count += 1
+    total = torch.stack(weighted_domains).sum() / float(
+        active_domain_count
+    )
     return DomainLosses(farmer=farmer, hands=hands, market=market, total=total)
 
 

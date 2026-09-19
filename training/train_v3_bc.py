@@ -143,6 +143,7 @@ class BCV3Config:
     strategy_conditioning: bool = False
     model_architecture: str = ARCHITECTURE_VERSION
     progress_every: int = 0
+    action_only_epochs: int = 0
     use_amp: bool = False
     amp_init_scale: float = 1024.0
     amp_growth_interval: int = 2000
@@ -175,6 +176,10 @@ class BCV3Config:
             raise ValueError("max_train_steps_per_epoch must be positive when set")
         if int(self.progress_every) < 0:
             raise ValueError("progress_every must be non-negative")
+        if int(self.action_only_epochs) < 0:
+            raise ValueError("action_only_epochs must be non-negative")
+        if int(self.action_only_epochs) > int(self.epochs):
+            raise ValueError("action_only_epochs must not exceed epochs")
         if float(self.amp_init_scale) <= 0.0:
             raise ValueError("amp_init_scale must be positive")
         if int(self.amp_growth_interval) <= 0:
@@ -2120,13 +2125,19 @@ def _train_epoch(
                         + ",".join(nonfinite_losses)
                     )
                 continue
+            action_only = int(epoch) <= int(
+                config.action_only_epochs
+            )
+            optimization_loss = (
+                losses["action"] if action_only else losses["total"]
+            )
             if amp_enabled:
                 if scaler is None:
                     raise RuntimeError("AMP training requires a GradScaler")
-                scaler.scale(losses["total"]).backward()
+                scaler.scale(optimization_loss).backward()
                 scaler.unscale_(optimizer)
             else:
-                losses["total"].backward()
+                optimization_loss.backward()
             norm, gradient_finite, scale_before, scale_after = _finish_optimizer_step(
                 model,
                 optimizer,
@@ -2152,12 +2163,15 @@ def _train_epoch(
             detached_losses = {
                 key: value.detach() for key, value in losses.items()
             }
+            detached_losses["optimization"] = (
+                optimization_loss.detach()
+            )
             for key, value in detached_losses.items():
                 if key not in metric_sums:
                     metric_sums[key] = torch.zeros_like(value)
                 metric_sums[key] = metric_sums[key] + value
             metric_count += 1
-            current_total = detached_losses["total"]
+            current_total = detached_losses["optimization"]
             loss_ema = (
                 current_total
                 if loss_ema is None
@@ -2202,6 +2216,12 @@ def _train_epoch(
                     "temporal_steps_per_sec": float(rate),
                     "eta_seconds": float(eta),
                     "loss_total": float(metric_row["total"]),
+                    "loss_optimization": float(
+                        metric_row.get("optimization", metric_row["total"])
+                    ),
+                    "optimization_objective": (
+                        "action" if action_only else "total"
+                    ),
                     "loss_ema": float(loss_ema_value),
                     "loss_action": float(metric_row.get("action", 0.0)),
                     "loss_market": float(metric_row.get("market", 0.0)),
