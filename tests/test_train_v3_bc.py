@@ -43,6 +43,73 @@ def _config(dataset, stage0, stage1, output):
     )
 
 
+def _v33_accepted_fixture(tmp_path):
+    import hashlib
+    import json
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from kaggrl.v3_strategy import build_strategy_manifest
+
+    def sha(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    dataset, stage0, stage1, _ = _fixture(tmp_path)
+    table = pq.read_table(dataset)
+    rows = table.to_pylist()
+    for row in rows:
+        row["team_id"] = 1
+    pq.write_table(pa.Table.from_pylist(rows), dataset)
+
+    stage0_payload = json.loads(Path(stage0).read_text(encoding="utf-8"))
+    stage0_payload["artifacts"]["dataset_sha256"] = sha(dataset)
+    Path(stage0).write_text(
+        json.dumps(stage0_payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    stage1_payload = json.loads(Path(stage1).read_text(encoding="utf-8"))
+    stage1_payload["artifacts"]["stage0_marker_sha256"] = sha(stage0)
+    Path(stage1).write_text(
+        json.dumps(stage1_payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    source_rows = pq.read_table(dataset).to_pylist()
+    effective_rows = [
+        {
+            "episode_id": int(row["episode_id"]),
+            "seat": int(row["seat"]),
+            "step": int(row["step"]),
+            "split": str(row["split"]),
+            "role": str(row["role"]),
+            "effective_action_json": str(row["canonical_action_json"]),
+        }
+        for row in source_rows
+    ]
+    effective_path = dataset.with_name("effective_actions.parquet")
+    pq.write_table(pa.Table.from_pylist(effective_rows), effective_path)
+
+    corpus = dataset.parent / "manifests" / "trusted_corpus_manifest.json"
+    summary = {
+        "source_dataset_sha256": sha(dataset),
+        "effective_actions_sha256": sha(effective_path),
+        "rows": len(effective_rows),
+        "source_corpus_manifest_sha256": sha(corpus),
+        "verified_replay_files": 1,
+        "builder_code_sha256": "b" * 64,
+        "verified_non_eod_transitions": max(1, len(effective_rows)),
+        "engine_module_version": "unit-test",
+        "engine_source_sha256": "c" * 64,
+    }
+    summary_path = (
+        dataset.parent / "manifests" / "effective_actions_summary.json"
+    )
+    summary_path.write_text(
+        json.dumps(summary, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return dataset, stage0, stage1, build_strategy_manifest([1])
+
+
 def test_v3_bc_config_declares_closed_loop_gap_thresholds():
     fields = BCV3Config.__dataclass_fields__
     assert fields["sequence_len"].default == 32
@@ -434,6 +501,151 @@ def test_v32_gpu_tensor_chunk_matches_legacy_at_mix_endpoints(tmp_path, mix):
         atol=1e-6,
         rtol=0.0,
     )
+
+
+def test_v33_scratch_run_uses_no_init_checkpoint(tmp_path):
+    from dataclasses import replace
+    from kaggrl.v3_3_schema import ARCHITECTURE_VERSION as V33_ARCH
+
+    dataset, stage0, stage1, manifest = _v33_accepted_fixture(tmp_path)
+    output = tmp_path / "checkpoints/v33-scratch"
+    config = replace(
+        _config(dataset, stage0, stage1, output),
+        init_mode="scratch",
+        sequence_len=2,
+        batch_sequences=1,
+        max_train_steps=2,
+        model_architecture=V33_ARCH,
+        strategy_conditioning=True,
+        teacher_mix_schedule=(1.0,),
+        validation_profile="fast",
+        selection_mode="last_epoch",
+        opening_replay_steps=0,
+    )
+    best = run_v3_bc(config, None)
+    payload = torch.load(best, map_location="cpu", weights_only=False)
+    assert payload["architecture_version"] == V33_ARCH
+    assert payload["init_checkpoint_sha256"] is None
+    assert payload["strategy_manifest_sha256"] == manifest.sha256
+    assert payload["migration_new_parameter_keys"] == []
+    assert payload["recurrent_stats"]["scratch_init"] is True
+    assert payload["train_steps"] == 2
+
+
+def test_v33_learning_rate_schedule_warms_up_and_decays():
+    from dataclasses import replace
+    from training.train_v3_bc import _scheduled_learning_rate
+
+    config = replace(
+        _config(Path("dataset"), Path("s0"), Path("s1"), Path("out")),
+        learning_rate=3e-4,
+        epochs=6,
+        lr_warmup_steps=20,
+        lr_min_ratio=0.15,
+    )
+    assert _scheduled_learning_rate(
+        config, epoch=1, train_steps=0
+    ) == pytest.approx(1.5e-5)
+    assert _scheduled_learning_rate(
+        config, epoch=1, train_steps=19
+    ) == pytest.approx(3e-4)
+    assert _scheduled_learning_rate(
+        config, epoch=6, train_steps=100
+    ) == pytest.approx(4.5e-5)
+
+
+def test_v33_online_dagger_round_is_in_run_and_deterministic(
+    tmp_path, monkeypatch,
+):
+    from dataclasses import replace
+    from test_train_v2_bc import _action, _state
+    from kaggrl.v3_3_model import TemporalIntentPolicyV33
+    from kaggrl.v3_3_schema import ARCHITECTURE_VERSION as V33_ARCH
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.build_v3_recovery_dataset import write_recovery_rows
+    import training.train_v3_bc as train_module
+
+    teacher = tmp_path / "v45.py"
+    teacher.write_text("def agent(obs, config=None): return {}\n")
+    config = replace(
+        _config(Path("dataset"), Path("s0"), Path("s1"), tmp_path / "run"),
+        init_mode="scratch",
+        epochs=3,
+        model_architecture=V33_ARCH,
+        strategy_conditioning=True,
+        online_dagger=True,
+        dagger_teacher_path=teacher,
+        dagger_start_epoch=1,
+        dagger_seeds_per_round=2,
+        dagger_seed_base=20270000,
+        dagger_strategy_slot=0,
+    )
+    manifest = build_strategy_manifest([1])
+    model = TemporalIntentPolicyV33(strategy_count=1).eval()
+    captured = {}
+
+    def fake_export(model_arg, path, *, default_strategy_slot):
+        assert model_arg is model
+        assert default_strategy_slot == 0
+        Path(path).write_bytes(b"fake-policy")
+        return Path(path)
+
+    def fake_collect(
+        policy_path, teacher_path, output_path, seeds, *,
+        episode_steps, strategy_slot,
+    ):
+        captured["seeds"] = list(seeds)
+        captured["episode_steps"] = int(episode_steps)
+        captured["strategy_slot"] = int(strategy_slot)
+        rows = [{
+            "episode_id": 700,
+            "seat": 0,
+            "step": 0,
+            "state": _state(0, 1),
+            "canonical_action": _action(1, 0),
+            "previous_action": {},
+            "previous_effect": {},
+            "effects": {},
+            "final_own_money": 0,
+            "final_margin": 0,
+            "terminal_result": 0,
+            "teacher_id": "v45",
+            "teacher_version": "mock-v45",
+            "supervision_kind": "accepted_policy",
+            "learner_model_sha256": "a" * 64,
+            "strategy_slot": 0,
+        }]
+        return write_recovery_rows(rows, output_path)
+
+    monkeypatch.setattr(train_module, "export_v3_3_numpy", fake_export)
+    monkeypatch.setattr(train_module, "collect_v45_recovery", fake_collect)
+
+    rows, cumulative, metadata = train_module._collect_online_dagger_round(
+        model,
+        config,
+        epoch=1,
+        output_dir=tmp_path / "run",
+        strategy_manifest=manifest,
+        recovery_rows_all=[],
+    )
+    assert captured["seeds"] == [20270000, 20270001]
+    assert captured["strategy_slot"] == 0
+    assert len(rows) == 1
+    assert cumulative.is_file()
+    assert metadata["new_rows"] == 1
+    assert metadata["cumulative_rows"] == 1
+
+    rows2, _, metadata2 = train_module._collect_online_dagger_round(
+        model,
+        config,
+        epoch=2,
+        output_dir=tmp_path / "run",
+        strategy_manifest=manifest,
+        recovery_rows_all=rows,
+    )
+    assert captured["seeds"] == [20270002, 20270003]
+    assert len(rows2) == 2
+    assert metadata2["cumulative_rows"] == 2
 
 
 def test_v33_run_migrates_v32_and_uses_strategy_recovery(tmp_path):

@@ -151,6 +151,7 @@ def test_v33_short_economic_head_receives_value_gradient():
 def test_v33_strategy_recovery_update_changes_economic_heads():
     from types import SimpleNamespace
     from kaggrl.v2_training_data import SequenceChunk
+    from kaggrl.v3_strategy import build_strategy_manifest
     from training.train_v3_bc import _recovery_update
 
     torch.manual_seed(33035)
@@ -180,9 +181,13 @@ def test_v33_strategy_recovery_update_changes_economic_heads():
         optimizer,
         chunk,
         None,
-        SimpleNamespace(gradient_clip=1.0),
+        SimpleNamespace(
+            gradient_clip=1.0,
+            gpu_tensor_training=True,
+        ),
         torch.device("cpu"),
         market_active_op_weights={"HIRE": 2.0},
+        strategy_manifest=build_strategy_manifest([1]),
     )
     assert np.isfinite(loss)
     assert state is not None

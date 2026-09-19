@@ -23,6 +23,7 @@ from kaggrl.v3_behavior import behavior_family, compute_domain_family_weights
 from kaggrl.v2_training_data import (
     SequenceChunk,
     V2EpisodeDataset,
+    _attach_auxiliary_targets,
     collate_v2_sequences,
     verify_effective_action_sidecar,
     verify_training_acceptance,
@@ -37,6 +38,7 @@ from kaggrl.v3_2_schema import (
     STOP_ID,
     STRATEGY_CORE_SCALE,
 )
+from kaggrl.v3_3_export import export_v3_3_numpy
 from kaggrl.v3_3_model import TemporalIntentPolicyV33
 from kaggrl.v3_3_schema import (
     ARCHITECTURE_VERSION as V33_ARCHITECTURE_VERSION,
@@ -51,7 +53,11 @@ from kaggrl.v3_tensor_losses import (
     tensor_total_pretrain_loss_sequence,
 )
 from kaggrl.v3_tensor_targets import TensorActionTargets
-from training.build_v3_recovery_dataset import read_recovery_rows
+from training.build_v3_recovery_dataset import (
+    collect_v45_recovery,
+    read_recovery_rows,
+    write_recovery_rows,
+)
 from training.train_v3_pretrain import (
     _detach_states,
     _episode_chunks,
@@ -92,6 +98,10 @@ class BCV3Config:
     sequence_len: int = 32
     batch_sequences: int = 4
     learning_rate: float = 2e-4
+    init_mode: str = "checkpoint"
+    lr_warmup_steps: int = 0
+    lr_min_ratio: float = 1.0
+    fused_optimizer: bool = True
     weight_decay: float = 1e-4
     gradient_clip: float = 1.0
     epochs: int = 2
@@ -112,6 +122,13 @@ class BCV3Config:
     early_stop_patience: int = 3
     recovery_dataset_path: Path | None = None
     recovery_every: int = 4
+    online_dagger: bool = False
+    dagger_teacher_path: Path | None = None
+    dagger_start_epoch: int = 1
+    dagger_seeds_per_round: int = 1
+    dagger_seed_base: int = 20270000
+    dagger_episode_steps: int = 720
+    dagger_strategy_slot: int = 0
     family_weight_cap: float | None = None
     market_active_op_weight_cap: float = 8.0
     market_active_op_weight_power: float = 0.75
@@ -138,6 +155,12 @@ class BCV3Config:
             raise ValueError("sequence_len and batch_sequences must be positive")
         if self.epochs <= 0 or self.learning_rate <= 0:
             raise ValueError("invalid BC optimization configuration")
+        if self.init_mode not in {"checkpoint", "scratch"}:
+            raise ValueError("init_mode must be 'checkpoint' or 'scratch'")
+        if int(self.lr_warmup_steps) < 0:
+            raise ValueError("lr_warmup_steps must be non-negative")
+        if not 0.0 < float(self.lr_min_ratio) <= 1.0:
+            raise ValueError("lr_min_ratio must be in (0, 1]")
         if self.gradient_clip <= 0 or self.torch_num_threads < 1:
             raise ValueError("invalid BC runtime configuration")
         if (
@@ -178,12 +201,27 @@ class BCV3Config:
         }:
             if not self.strategy_conditioning:
                 raise ValueError("V3.2/V3.3 requires strategy_conditioning")
+        if self.init_mode == "scratch" and self.model_architecture != V33_ARCHITECTURE_VERSION:
+            raise ValueError("scratch init is currently supported only for V3.3")
         if (
             self.model_architecture == V32_ARCHITECTURE_VERSION
             and self.recovery_dataset_path is not None
         ):
             raise ValueError("V3.2 R0 does not allow recovery supervision")
-        if self.recovery_dataset_path is not None and self.recovery_every < 3:
+        if self.online_dagger:
+            if self.model_architecture != V33_ARCHITECTURE_VERSION:
+                raise ValueError("online_dagger requires V3.3")
+            if self.dagger_teacher_path is None:
+                raise ValueError("online_dagger requires dagger_teacher_path")
+            if int(self.dagger_start_epoch) < 1:
+                raise ValueError("dagger_start_epoch must be >= 1")
+            if int(self.dagger_seeds_per_round) < 1:
+                raise ValueError("dagger_seeds_per_round must be >= 1")
+            if int(self.dagger_episode_steps) < 2:
+                raise ValueError("dagger_episode_steps must be >= 2")
+            if int(self.dagger_strategy_slot) < 0:
+                raise ValueError("dagger_strategy_slot must be non-negative")
+        if (self.recovery_dataset_path is not None or self.online_dagger) and self.recovery_every < 3:
             raise ValueError("recovery_every must preserve an expert-majority schedule")
         if self.family_weight_cap is not None and float(self.family_weight_cap) < 1.0:
             raise ValueError("family_weight_cap must be >= 1 when enabled")
@@ -251,12 +289,60 @@ def _initialize_v32_migration(
             model.strategy_embedding.weight.zero_()
 
 
+def _scheduled_learning_rate(
+    config: BCV3Config,
+    *,
+    epoch: int,
+    train_steps: int,
+) -> float:
+    base = float(config.learning_rate)
+    warmup = int(config.lr_warmup_steps)
+    warmup_scale = (
+        1.0
+        if warmup <= 0
+        else min(1.0, float(train_steps + 1) / float(warmup))
+    )
+    if int(config.epochs) <= 1:
+        decay_scale = 1.0
+    else:
+        progress = float(max(0, int(epoch) - 1)) / float(
+            max(1, int(config.epochs) - 1)
+        )
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        minimum = float(config.lr_min_ratio)
+        decay_scale = minimum + (1.0 - minimum) * cosine
+    return base * warmup_scale * decay_scale
+
+
+def _set_optimizer_lr(optimizer, learning_rate: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(learning_rate)
+
+
+def _build_adamw(model, config: BCV3Config, device):
+    kwargs = {
+        "lr": float(config.learning_rate),
+        "weight_decay": float(config.weight_decay),
+    }
+    if (
+        bool(config.fused_optimizer)
+        and getattr(device, "type", str(device).split(":")[0]) == "cuda"
+    ):
+        try:
+            return torch.optim.AdamW(model.parameters(), fused=True, **kwargs), True
+        except (TypeError, RuntimeError):
+            pass
+    return torch.optim.AdamW(model.parameters(), **kwargs), False
+
+
 def _config_dict(config: BCV3Config) -> dict[str, Any]:
     value = asdict(config)
     for key in ("dataset_path", "stage0_marker", "stage1_marker", "output_dir"):
         value[key] = str(value[key])
     if value.get("recovery_dataset_path") is not None:
         value["recovery_dataset_path"] = str(value["recovery_dataset_path"])
+    if value.get("dagger_teacher_path") is not None:
+        value["dagger_teacher_path"] = str(value["dagger_teacher_path"])
     value["selection_weights"] = dict(
         V32_SELECTION_WEIGHTS
         if config.model_architecture in {
@@ -284,10 +370,20 @@ def _validate_strategy_coverage(
 
 
 def _strategy_slots_for_rows(rows, manifest: StrategyManifest, device) -> torch.Tensor:
-    return torch.tensor(
-        [strategy_slot_for_team(int(row["team_id"]), manifest) for row in rows],
-        dtype=torch.long, device=device,
-    )
+    slots = []
+    for row in rows:
+        if row.get("strategy_slot") is not None:
+            slot = int(row["strategy_slot"])
+            if not 0 <= slot < manifest.size:
+                raise ValueError(
+                    f"strategy_slot {slot} outside strategy manifest"
+                )
+            slots.append(slot)
+        else:
+            slots.append(
+                strategy_slot_for_team(int(row["team_id"]), manifest)
+            )
+    return torch.tensor(slots, dtype=torch.long, device=device)
 
 
 def _opening_training_rows(dataset: V2EpisodeDataset) -> list[dict[str, Any]]:
@@ -1277,50 +1373,100 @@ def _recovery_step_loss(
 def _recovery_update(
     model, optimizer, chunk, state, config, device, family_weights=None,
     market_active_op_weights=None,
+    strategy_manifest: StrategyManifest | None = None,
 ):
-    losses = []
-    for row in chunk.rows:
-        batch = collate_transitions([row])
-        move_step_batch(batch, device)
-        strategy_slots = None
-        if getattr(model, "strategy_embedding", None) is not None:
-            if row.get("strategy_slot") is None:
-                raise ValueError(
-                    "strategy-conditioned recovery row requires strategy_slot"
-                )
-            slot = int(row["strategy_slot"])
-            strategy_count = int(getattr(model, "strategy_count", 0) or 0)
-            if not 0 <= slot < strategy_count:
-                raise ValueError(
-                    f"recovery strategy_slot {slot} outside [0, {strategy_count - 1}]"
-                )
-            strategy_slots = torch.tensor(
-                [slot], dtype=torch.long, device=device,
-            )
-        output = model.teacher_step(
-            batch,
-            batch.canonical_actions,
-            state,
-            strategy_slots=strategy_slots,
+    kinds = {
+        str(row.get("supervision_kind", ""))
+        for row in chunk.rows
+    }
+    use_tensor_recovery = bool(
+        getattr(config, "gpu_tensor_training", False)
+        and kinds
+        and kinds.issubset({"expert", "accepted_policy"})
+        and len(chunk.rows) <= int(getattr(model.core, "window", 0))
+    )
+
+    if use_tensor_recovery:
+        prepared_rows = [dict(row) for row in chunk.rows]
+        _attach_auxiliary_targets(prepared_rows)
+        prepared_chunk = SequenceChunk(
+            episode_id=int(chunk.episode_id),
+            seat=int(chunk.seat),
+            rows=tuple(prepared_rows),
+            episode_start=bool(chunk.episode_start),
+            episode_end=bool(chunk.episode_end),
         )
-        losses.append(_recovery_step_loss(
-            output,
-            batch.canonical_actions,
-            supervision_kind=row.get("supervision_kind", ""),
+        states = [state]
+        tensor_losses, states = _teacher_chunk_cached(
+            model,
+            [(0, prepared_chunk)],
+            states,
+            device,
+            recurrent_stats=None,
+            strategy_manifest=strategy_manifest,
             family_weights=family_weights,
             market_active_op_weights=market_active_op_weights,
-        ))
-        state = output.temporal_state
-    total = torch.stack(losses).mean()
+            teacher_mix_probability=1.0,
+            conditioning_rng=np.random.default_rng(
+                int(chunk.episode_id) * 1009 + int(chunk.start_step)
+            ),
+            gpu_tensor_training=True,
+        )
+        total = tensor_losses["action"]
+        state = states[0]
+    else:
+        losses = []
+        for row in chunk.rows:
+            batch = collate_transitions([row])
+            move_step_batch(batch, device)
+            strategy_slots = None
+            if getattr(model, "strategy_embedding", None) is not None:
+                if row.get("strategy_slot") is None:
+                    raise ValueError(
+                        "strategy-conditioned recovery row requires strategy_slot"
+                    )
+                slot = int(row["strategy_slot"])
+                strategy_count = int(
+                    getattr(model, "strategy_count", 0) or 0
+                )
+                if not 0 <= slot < strategy_count:
+                    raise ValueError(
+                        f"recovery strategy_slot {slot} outside "
+                        f"[0, {strategy_count - 1}]"
+                    )
+                strategy_slots = torch.tensor(
+                    [slot], dtype=torch.long, device=device,
+                )
+            output = model.teacher_step(
+                batch,
+                batch.canonical_actions,
+                state,
+                strategy_slots=strategy_slots,
+            )
+            losses.append(_recovery_step_loss(
+                output,
+                batch.canonical_actions,
+                supervision_kind=row.get("supervision_kind", ""),
+                family_weights=family_weights,
+                market_active_op_weights=market_active_op_weights,
+            ))
+            state = output.temporal_state
+        total = torch.stack(losses).mean()
+
     if not torch.isfinite(total):
         raise RuntimeError("non-finite v3 recovery action loss")
     optimizer.zero_grad(set_to_none=True)
     total.backward()
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+    norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), config.gradient_clip,
+    )
     if not torch.isfinite(torch.as_tensor(norm)):
         raise RuntimeError("non-finite v3 recovery gradient norm")
     optimizer.step()
-    return float(total.detach().cpu().item()), model.core.detach_state(state)
+    return (
+        float(total.detach().cpu().item()),
+        model.core.detach_state(state),
+    )
 
 
 def _finish_optimizer_step(
@@ -1330,17 +1476,16 @@ def _finish_optimizer_step(
         model.parameters(), config.gradient_clip,
     )
     norm_tensor = torch.as_tensor(norm)
-    finite = bool(torch.isfinite(norm_tensor).item())
     if amp_enabled:
         if scaler is None:
             raise RuntimeError("AMP training requires a GradScaler")
-        scale_before = float(scaler.get_scale())
-        # GradScaler.step() inspects the overflow state captured by unscale_().
-        # When overflow is present it intentionally skips optimizer.step().
+        # GradScaler owns overflow detection. Avoid .item()/get_scale() here:
+        # both force a CUDA->CPU synchronization on every optimizer step.
         scaler.step(optimizer)
         scaler.update()
-        scale_after = float(scaler.get_scale())
-        return float(norm_tensor.detach().cpu()), finite, scale_before, scale_after
+        return norm_tensor.detach(), True, None, None
+
+    finite = bool(torch.isfinite(norm_tensor).item())
     if not finite:
         raise RuntimeError("non-finite v3 BC gradient norm")
     optimizer.step()
@@ -1364,14 +1509,25 @@ def _train_epoch(
     conditioning_rng = np.random.default_rng(
         int(config.seed) + 3000001 * int(epoch),
     )
-    metrics = []
+    metric_sums: dict[str, torch.Tensor] = {}
+    metric_count = 0
     recovery_losses = []
+    loss_ema = None
     stop = False
     epoch_start_steps = int(train_steps)
+    epoch_start_expert_updates = int(recurrent_stats["expert_updates"])
+    epoch_start_recovery_updates = int(recurrent_stats["recovery_updates"])
     epoch_start_temporal = int(recurrent_stats["temporal_steps"])
     epoch_started = time.perf_counter()
     amp_device_type = getattr(device, "type", str(device).split(":")[0])
     amp_enabled = bool(config.use_amp and amp_device_type == "cuda")
+    last_logged_amp_scale = None
+    if (
+        amp_enabled
+        and scaler is not None
+        and int(config.progress_every) > 0
+    ):
+        last_logged_amp_scale = float(scaler.get_scale())
     if prepared_training_groups is None:
         prepared_groups = []
         for episodes in _episode_groups(
@@ -1415,10 +1571,17 @@ def _train_epoch(
         recovery_cursor += 1
         key = (int(chunk.episode_id), int(chunk.seat))
         state = None if chunk.episode_start else recovery_states.get(key)
+        _set_optimizer_lr(
+            optimizer,
+            _scheduled_learning_rate(
+                config, epoch=epoch, train_steps=train_steps,
+            ),
+        )
         loss, state = _recovery_update(
             model, optimizer, chunk, state, config, device,
             family_weights=family_weights,
             market_active_op_weights=market_active_op_weights,
+            strategy_manifest=strategy_manifest,
         )
         recovery_states[key] = None if chunk.episode_end else state
         recurrent_stats["recovery_updates"] += 1
@@ -1463,6 +1626,10 @@ def _train_epoch(
             )
             for slot, _ in active:
                 recurrent_stats["state_resets" if states[slot] is None else "state_carries"] += 1
+            current_lr = _scheduled_learning_rate(
+                config, epoch=epoch, train_steps=train_steps,
+            )
+            _set_optimizer_lr(optimizer, current_lr)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=amp_device_type,
@@ -1478,7 +1645,10 @@ def _train_epoch(
                     conditioning_rng=conditioning_rng,
                     gpu_tensor_training=bool(config.gpu_tensor_training),
                 )
-            if not torch.isfinite(losses["total"]):
+            if (
+                not amp_enabled
+                and not bool(torch.isfinite(losses["total"]).item())
+            ):
                 raise RuntimeError("non-finite v3 BC loss")
             if amp_enabled:
                 if scaler is None:
@@ -1509,37 +1679,77 @@ def _train_epoch(
                     flush=True,
                 )
                 continue
-            metric_row = _float_dict(losses)
-            metrics.append(metric_row)
+            detached_losses = {
+                key: value.detach() for key, value in losses.items()
+            }
+            for key, value in detached_losses.items():
+                if key not in metric_sums:
+                    metric_sums[key] = torch.zeros_like(value)
+                metric_sums[key] = metric_sums[key] + value
+            metric_count += 1
+            current_total = detached_losses["total"]
+            loss_ema = (
+                current_total
+                if loss_ema is None
+                else 0.90 * loss_ema + 0.10 * current_total
+            )
             recurrent_stats["expert_updates"] += 1
             train_steps += 1
             if (
                 int(config.progress_every) > 0
                 and train_steps % int(config.progress_every) == 0
             ):
+                metric_row = _float_dict(detached_losses)
+                loss_ema_value = float(loss_ema.detach().cpu())
+                if not math.isfinite(float(metric_row["total"])):
+                    raise RuntimeError("non-finite v3 BC loss")
+                current_amp_scale = None
+                if amp_enabled and scaler is not None:
+                    current_amp_scale = float(scaler.get_scale())
+                    if (
+                        last_logged_amp_scale is not None
+                        and current_amp_scale < last_logged_amp_scale
+                    ):
+                        recurrent_stats["amp_overflow_skips"] += 1
+                    last_logged_amp_scale = current_amp_scale
                 elapsed = max(time.perf_counter() - epoch_started, 1e-9)
                 epoch_step = int(train_steps) - epoch_start_steps
+                epoch_expert_step = (
+                    int(recurrent_stats["expert_updates"])
+                    - epoch_start_expert_updates
+                )
                 temporal_delta = int(recurrent_stats["temporal_steps"]) - epoch_start_temporal
                 rate = float(temporal_delta) / elapsed
                 eta = (
-                    max(0, epoch_expected_updates - epoch_step)
-                    * elapsed / max(epoch_step, 1)
+                    max(0, epoch_expected_updates - epoch_expert_step)
+                    * elapsed / max(epoch_expert_step, 1)
                 )
                 progress = {
                     "epoch": int(epoch),
                     "epoch_step": int(epoch_step),
-                    "epoch_steps": int(epoch_expected_updates),
+                    "epoch_expert_step": int(epoch_expert_step),
+                    "epoch_expert_steps": int(epoch_expected_updates),
+                    "epoch_recovery_steps": int(
+                        int(recurrent_stats["recovery_updates"])
+                        - epoch_start_recovery_updates
+                    ),
                     "train_steps": int(train_steps),
                     "active_sequences": int(len(active)),
                     "temporal_steps": int(recurrent_stats["temporal_steps"]),
                     "temporal_steps_per_sec": float(rate),
                     "eta_seconds": float(eta),
                     "loss_total": float(metric_row["total"]),
-                    "amp": bool(amp_enabled),
-                    "amp_scale": (
-                        float(scaler.get_scale()) if amp_enabled and scaler is not None
-                        else None
+                    "loss_ema": float(loss_ema_value),
+                    "loss_action": float(metric_row.get("action", 0.0)),
+                    "loss_market": float(metric_row.get("market", 0.0)),
+                    "loss_economic": (
+                        None
+                        if "economic" not in metric_row
+                        else float(metric_row["economic"])
                     ),
+                    "learning_rate": float(current_lr),
+                    "amp": bool(amp_enabled),
+                    "amp_scale": current_amp_scale,
                     "amp_overflow_skips": int(recurrent_stats["amp_overflow_skips"]),
                     "gpu_tensor_training": bool(config.gpu_tensor_training),
                     "tensor_sequence_chunks": int(
@@ -1563,17 +1773,35 @@ def _train_epoch(
                 )
         if stop:
             break
-    if not metrics and not recovery_losses:
+    if metric_count <= 0 and not recovery_losses:
         raise RuntimeError("v3 BC epoch executed no optimizer steps")
-    summary = _mean_float_dict(metrics) if metrics else {}
+    summary = (
+        {
+            key: float((value / float(metric_count)).detach().cpu())
+            for key, value in metric_sums.items()
+        }
+        if metric_count > 0
+        else {}
+    )
     elapsed = max(time.perf_counter() - epoch_started, 1e-9)
     temporal_delta = int(recurrent_stats["temporal_steps"]) - epoch_start_temporal
     summary["teacher_mix_probability"] = float(teacher_mix_probability)
     summary["amp_enabled"] = bool(amp_enabled)
     summary["epoch_elapsed_seconds"] = float(elapsed)
     summary["temporal_steps_per_sec"] = float(temporal_delta) / elapsed
+    epoch_expert_updates = (
+        int(recurrent_stats["expert_updates"]) - epoch_start_expert_updates
+    )
+    epoch_recovery_updates = (
+        int(recurrent_stats["recovery_updates"]) - epoch_start_recovery_updates
+    )
+    summary["expert_updates"] = int(epoch_expert_updates)
+    summary["recovery_updates"] = int(epoch_recovery_updates)
     summary["optimizer_steps_per_sec"] = float(
         int(train_steps) - epoch_start_steps
+    ) / elapsed
+    summary["expert_updates_per_sec"] = float(
+        epoch_expert_updates
     ) / elapsed
     if recovery_losses:
         summary["recovery_action"] = float(sum(recovery_losses) / len(recovery_losses))
@@ -2086,7 +2314,91 @@ def _write_manifest(output_dir: Path, paths: list[Path]):
     )
 
 
-def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
+def _collect_online_dagger_round(
+    model,
+    config: BCV3Config,
+    *,
+    epoch: int,
+    output_dir: Path,
+    strategy_manifest: StrategyManifest,
+    recovery_rows_all: list[dict[str, Any]],
+):
+    if (
+        not bool(config.online_dagger)
+        or int(epoch) < int(config.dagger_start_epoch)
+        or int(epoch) >= int(config.epochs)
+    ):
+        return recovery_rows_all, None, None
+
+    teacher_path = Path(config.dagger_teacher_path)
+    if not teacher_path.is_file():
+        raise FileNotFoundError(
+            f"DAgger teacher not found: {teacher_path}"
+        )
+    slot = int(config.dagger_strategy_slot)
+    if not 0 <= slot < strategy_manifest.size:
+        raise ValueError(
+            f"dagger_strategy_slot {slot} outside strategy manifest"
+        )
+
+    round_index = int(epoch) - int(config.dagger_start_epoch)
+    seed_start = int(config.dagger_seed_base) + (
+        round_index * int(config.dagger_seeds_per_round)
+    )
+    seeds = list(range(
+        seed_start,
+        seed_start + int(config.dagger_seeds_per_round),
+    ))
+    dagger_dir = output_dir / "dagger"
+    dagger_dir.mkdir(parents=True, exist_ok=True)
+    policy_path = dagger_dir / f"epoch_{epoch:03d}_policy.npz"
+    round_path = dagger_dir / f"epoch_{epoch:03d}_v45.jsonl"
+
+    export_v3_3_numpy(
+        model,
+        policy_path,
+        default_strategy_slot=slot,
+    )
+    collect_v45_recovery(
+        policy_path,
+        teacher_path,
+        round_path,
+        seeds,
+        episode_steps=int(config.dagger_episode_steps),
+        strategy_slot=slot,
+    )
+    round_rows = read_recovery_rows(round_path)
+    combined_rows = list(recovery_rows_all)
+    combined_rows.extend(round_rows)
+
+    cumulative_path = (
+        dagger_dir / f"recovery_cumulative_epoch_{epoch:03d}.jsonl"
+    )
+    write_recovery_rows(combined_rows, cumulative_path)
+    cumulative_sha = _sha256(cumulative_path)
+    metadata = {
+        "epoch": int(epoch),
+        "seeds": seeds,
+        "games": len(seeds) * 2,
+        "new_rows": len(round_rows),
+        "cumulative_rows": len(combined_rows),
+        "policy_path": str(policy_path),
+        "round_path": str(round_path),
+        "cumulative_path": str(cumulative_path),
+        "cumulative_sha256": cumulative_sha,
+    }
+    print(
+        "FARMOS_DAGGER_ROUND="
+        + json.dumps(metadata, sort_keys=True),
+        flush=True,
+    )
+    return combined_rows, cumulative_path, metadata
+
+
+def run_v3_bc(
+    config: BCV3Config,
+    init_checkpoint: Path | None = None,
+) -> Path:
     config.validate()
     acceptance = verify_training_acceptance(
         config.stage0_marker, config.stage1_marker,
@@ -2094,29 +2406,43 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
     dataset_sha = _sha256(config.dataset_path)
     if dataset_sha != acceptance["dataset_sha256"]:
         raise RuntimeError("v3 BC dataset SHA does not match accepted corpus")
-    init_checkpoint = Path(init_checkpoint)
-    initial = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
-    init_architecture = initial.get("architecture_version")
-    if config.model_architecture == V33_ARCHITECTURE_VERSION:
-        allowed_init = {
-            V32_ARCHITECTURE_VERSION,
-            V33_ARCHITECTURE_VERSION,
-        }
-    elif config.model_architecture == V32_ARCHITECTURE_VERSION:
-        allowed_init = {
-            ARCHITECTURE_VERSION,
-            STRATEGY_ARCHITECTURE_VERSION,
-            V32_ARCHITECTURE_VERSION,
-        }
+
+    scratch_init = config.init_mode == "scratch"
+    if scratch_init:
+        if init_checkpoint is not None:
+            raise ValueError(
+                "scratch training must not receive an init checkpoint"
+            )
+        initial: dict[str, Any] = {}
+        init_architecture = "scratch"
     else:
-        allowed_init = (
-            {ARCHITECTURE_VERSION, STRATEGY_ARCHITECTURE_VERSION}
-            if config.strategy_conditioning else {ARCHITECTURE_VERSION}
+        if init_checkpoint is None:
+            raise ValueError("checkpoint init requires init_checkpoint")
+        init_checkpoint = Path(init_checkpoint)
+        initial = torch.load(
+            init_checkpoint, map_location="cpu", weights_only=False,
         )
-    if init_architecture not in allowed_init:
-        raise RuntimeError("v3 BC initialization architecture mismatch")
-    if initial.get("dataset_sha256") not in {None, dataset_sha}:
-        raise RuntimeError("v3 BC initialization dataset SHA mismatch")
+        init_architecture = initial.get("architecture_version")
+        if config.model_architecture == V33_ARCHITECTURE_VERSION:
+            allowed_init = {
+                V32_ARCHITECTURE_VERSION,
+                V33_ARCHITECTURE_VERSION,
+            }
+        elif config.model_architecture == V32_ARCHITECTURE_VERSION:
+            allowed_init = {
+                ARCHITECTURE_VERSION,
+                STRATEGY_ARCHITECTURE_VERSION,
+                V32_ARCHITECTURE_VERSION,
+            }
+        else:
+            allowed_init = (
+                {ARCHITECTURE_VERSION, STRATEGY_ARCHITECTURE_VERSION}
+                if config.strategy_conditioning else {ARCHITECTURE_VERSION}
+            )
+        if init_architecture not in allowed_init:
+            raise RuntimeError("v3 BC initialization architecture mismatch")
+        if initial.get("dataset_sha256") not in {None, dataset_sha}:
+            raise RuntimeError("v3 BC initialization dataset SHA mismatch")
     torch.set_num_threads(config.torch_num_threads)
     torch.manual_seed(config.seed)
     random.seed(config.seed)
@@ -2171,6 +2497,7 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
         V32_ARCHITECTURE_VERSION,
         V33_ARCHITECTURE_VERSION,
     }:
+        market_continue_counts = _training_market_continue_counts(train_data)
         market_active_op_counts = _training_market_active_counts(train_data)
         market_active_op_weights = _balanced_market_active_op_weights(
             market_active_op_counts,
@@ -2185,39 +2512,47 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
     if config.model_architecture == V33_ARCHITECTURE_VERSION:
         if strategy_manifest is None:
             raise RuntimeError("V3.3 requires a strategy manifest")
-        if initial.get("strategy_manifest_sha256") != strategy_manifest.sha256:
-            raise RuntimeError(
-                "strategy manifest mismatch in V3.3 initialization checkpoint"
-            )
         model = TemporalIntentPolicyV33(
             strategy_count=strategy_manifest.size,
         )
-        if init_architecture == V33_ARCHITECTURE_VERSION:
-            model.load_state_dict(initial["model_state"], strict=True)
+        if scratch_init:
+            # True scratch run: keep constructor initialization and do not
+            # import any weights from V3.2/V3.3 checkpoints.
+            migration_new_parameter_keys = ()
         else:
-            incompatible = model.load_state_dict(
-                initial["model_state"], strict=False,
-            )
-            expected_missing = {
-                "economic_continue_head.bias",
-                "economic_continue_head.weight",
-                "economic_active_head.bias",
-                "economic_active_head.weight",
-                "short_economic_head.bias",
-                "short_economic_head.weight",
-            }
             if (
-                set(incompatible.missing_keys) != expected_missing
-                or incompatible.unexpected_keys
+                initial.get("strategy_manifest_sha256")
+                != strategy_manifest.sha256
             ):
                 raise RuntimeError(
-                    "unexpected state mismatch while migrating V3.2 to V3.3: "
-                    f"missing={sorted(incompatible.missing_keys)} "
-                    f"unexpected={sorted(incompatible.unexpected_keys)}"
+                    "strategy manifest mismatch in V3.3 initialization checkpoint"
                 )
-            migration_new_parameter_keys = tuple(
-                sorted(incompatible.missing_keys)
-            )
+            if init_architecture == V33_ARCHITECTURE_VERSION:
+                model.load_state_dict(initial["model_state"], strict=True)
+            else:
+                incompatible = model.load_state_dict(
+                    initial["model_state"], strict=False,
+                )
+                expected_missing = {
+                    "economic_continue_head.bias",
+                    "economic_continue_head.weight",
+                    "economic_active_head.bias",
+                    "economic_active_head.weight",
+                    "short_economic_head.bias",
+                    "short_economic_head.weight",
+                }
+                if (
+                    set(incompatible.missing_keys) != expected_missing
+                    or incompatible.unexpected_keys
+                ):
+                    raise RuntimeError(
+                        "unexpected state mismatch while migrating V3.2 to V3.3: "
+                        f"missing={sorted(incompatible.missing_keys)} "
+                        f"unexpected={sorted(incompatible.unexpected_keys)}"
+                    )
+                migration_new_parameter_keys = tuple(
+                    sorted(incompatible.missing_keys)
+                )
     elif config.model_architecture == V32_ARCHITECTURE_VERSION:
         if strategy_manifest is None:
             raise RuntimeError("V3.2 requires a strategy manifest")
@@ -2316,11 +2651,7 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
                 sorted(incompatible.missing_keys)
             )
     model.to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+    optimizer, optimizer_fused = _build_adamw(model, config, device)
     amp_enabled = bool(
         config.use_amp
         and getattr(device, "type", str(device).split(":")[0]) == "cuda"
@@ -2345,10 +2676,12 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
     val_episodes = _validation_chunks(val_data, config)
     recovery_dataset_sha = None
     recovery_chunks = []
+    recovery_rows_all: list[dict[str, Any]] = []
     if config.recovery_dataset_path is not None:
         recovery_path = Path(config.recovery_dataset_path)
         recovery_dataset_sha = _sha256(recovery_path)
         recovery_rows = read_recovery_rows(recovery_path)
+        recovery_rows_all.extend(recovery_rows)
         if strategy_manifest is not None:
             for row in recovery_rows:
                 if row.get("strategy_slot") is None:
@@ -2372,6 +2705,40 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
             device,
             strategy_manifest,
         )
+    )
+    cached_updates_per_epoch = None
+    cached_max_active_sequences = None
+    if prepared_training_groups is not None:
+        cached_updates_per_epoch = sum(
+            len(group.updates) for group in prepared_training_groups
+        )
+        cached_max_active_sequences = max(
+            len(update.active)
+            for group in prepared_training_groups
+            for update in group.updates
+        )
+    train_plan = {
+        "train_episodes": int(len(train_data)),
+        "train_rows": int(sum(len(episode.rows) for episode in train_data)),
+        "sequence_len": int(config.sequence_len),
+        "configured_batch_sequences": int(config.batch_sequences),
+        "expert_updates_per_epoch": cached_updates_per_epoch,
+        "max_active_sequences": cached_max_active_sequences,
+        "epochs": int(config.epochs),
+        "teacher_mix_schedule": [
+            float(value) for value in config.teacher_mix_schedule
+        ],
+        "init_mode": str(config.init_mode),
+        "online_dagger": bool(config.online_dagger),
+        "recovery_every": int(config.recovery_every),
+        "optimizer_fused": bool(optimizer_fused),
+        "market_continue_counts": market_continue_counts,
+        "market_active_op_counts": market_active_op_counts,
+        "market_active_op_weights": market_active_op_weights,
+    }
+    print(
+        "FARMOS_TRAIN_PLAN=" + json.dumps(train_plan, sort_keys=True),
+        flush=True,
     )
 
     output_dir = Path(config.output_dir)
@@ -2402,6 +2769,10 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
         "recovery_updates": 0,
         "recovery_temporal_steps": 0,
         "amp_overflow_skips": 0,
+        "optimizer_fused": bool(optimizer_fused),
+        "scratch_init": bool(scratch_init),
+        "dagger_rounds": 0,
+        "dagger_rows": 0,
         "tensor_sequence_chunks": 0,
         "cached_tensor_sequence_chunks": 0,
         "gpu_batch_cache_enabled": bool(gpu_batch_cache_stats["enabled"]),
@@ -2428,7 +2799,7 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
     best_teacher_loss = float("inf")
     best_epoch = 0
     train_steps = 0
-    init_sha = _sha256(init_checkpoint)
+    init_sha = None if scratch_init else _sha256(Path(init_checkpoint))
 
     for epoch in range(1, config.epochs + 1):
         train_metrics, train_steps, recovery_cursor, recovery_states = _train_epoch(
@@ -2556,10 +2927,36 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
             best_teacher_loss = aux
             best_epoch = epoch
             torch.save(payload, best_path)
+
+        dagger_metadata = None
+        if config.online_dagger:
+            if strategy_manifest is None:
+                raise RuntimeError("online DAgger requires strategy manifest")
+            recovery_rows_all, cumulative_path, dagger_metadata = (
+                _collect_online_dagger_round(
+                    model,
+                    config,
+                    epoch=epoch,
+                    output_dir=output_dir,
+                    strategy_manifest=strategy_manifest,
+                    recovery_rows_all=recovery_rows_all,
+                )
+            )
+            if cumulative_path is not None:
+                recovery_dataset_sha = _sha256(cumulative_path)
+                recovery_chunks = _recovery_chunks(
+                    recovery_rows_all, config.sequence_len,
+                )
+                recovery_cursor = 0
+                recovery_states = {}
+                recurrent_stats["dagger_rounds"] += 1
+                recurrent_stats["dagger_rows"] = len(recovery_rows_all)
+
         history_row = {
             "epoch": epoch,
             "train": train_metrics,
             "validation": validation,
+            "dagger": dagger_metadata,
             "best_epoch": int(best_epoch),
             "best_selection_score": (
                 None

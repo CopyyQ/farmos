@@ -264,6 +264,43 @@ def test_tensor_teacher_decoder_matches_opening_strategy_residual():
     )
 
 
+def test_tensor_mixed_full_teacher_skips_sampling_path(monkeypatch):
+    import kaggrl.v3_tensor_decoder as decoder_module
+
+    row = _row(
+        1,
+        _unit("EAST"),
+        [_unit("PICKUP", "WHEAT", 1)],
+        [_order("BUY_SEED", "WHEAT", 1), _stop()],
+    )
+    batch = collate_transitions([row])
+    model = TemporalIntentPolicyV32(strategy_count=0).eval()
+    targets = TensorActionTargets.from_actions(
+        batch.canonical_actions,
+        max_units=batch.own_units.shape[1],
+    )
+    ledger = TensorLedger.from_states(batch.structured_states)
+
+    def fail_sampling(*args, **kwargs):
+        raise AssertionError("full teacher forcing must not sample quantity")
+
+    monkeypatch.setattr(
+        decoder_module,
+        "_sample_quantity_argmax_tensor",
+        fail_sampling,
+    )
+    with torch.no_grad():
+        output = teacher_step_tensor_mixed(
+            model,
+            batch,
+            targets,
+            ledger,
+            state=None,
+            teacher_mix_probability=1.0,
+        )
+    assert output.unit_op_logits.shape[0] == 1
+
+
 def test_tensor_mixed_zero_matches_legacy_model_conditioning():
     torch.manual_seed(67)
     rows = [

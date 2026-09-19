@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("--dataset", default=None)
     parser.add_argument("--init-checkpoint", default=None)
     parser.add_argument("--recovery-dataset", default=None)
+    parser.add_argument("--dagger-teacher", default=None)
     parser.add_argument("--skip-prepare", action="store_true")
     args = parser.parse_args()
 
@@ -49,19 +50,27 @@ def main() -> None:
     dataset = ROOT / "data/top_tier/live_v2/transitions.parquet"
     stage0 = ROOT / "data/top_tier/live_v2/manifests/STAGE0_ACCEPTED.json"
     stage1 = ROOT / "checkpoints/rl_v2_stage1/STAGE1_ACCEPTED.json"
-    init_checkpoint = (
-        Path(args.init_checkpoint).resolve()
-        if args.init_checkpoint
-        else ROOT / "assets/v32_smoke_init.pt"
-    )
-    if not init_checkpoint.is_file():
-        raise FileNotFoundError(init_checkpoint)
+    values = load_config(config_path)
+    scratch_init = str(values.get("init_mode", "checkpoint")) == "scratch"
+    if scratch_init:
+        if args.init_checkpoint:
+            raise ValueError(
+                "scratch config must not receive --init-checkpoint"
+            )
+        init_checkpoint = None
+    else:
+        init_checkpoint = (
+            Path(args.init_checkpoint).resolve()
+            if args.init_checkpoint
+            else ROOT / "assets/v32_smoke_init.pt"
+        )
+        if not init_checkpoint.is_file():
+            raise FileNotFoundError(init_checkpoint)
     run_name = args.run_name or (
         config_path.stem + "_" + time.strftime("%Y%m%d_%H%M%S")
     )
     output = ROOT / "runs" / run_name
 
-    values = load_config(config_path)
     if args.recovery_dataset:
         values["recovery_dataset_path"] = str(
             Path(args.recovery_dataset).resolve()
@@ -71,6 +80,15 @@ def main() -> None:
         if not recovery.is_absolute():
             recovery = (ROOT / recovery).resolve()
         values["recovery_dataset_path"] = str(recovery)
+    if args.dagger_teacher:
+        values["dagger_teacher_path"] = str(
+            Path(args.dagger_teacher).resolve()
+        )
+    elif values.get("dagger_teacher_path"):
+        teacher = Path(values["dagger_teacher_path"])
+        if not teacher.is_absolute():
+            teacher = (ROOT / teacher).resolve()
+        values["dagger_teacher_path"] = str(teacher)
     config = BCV3Config(
         dataset_path=dataset,
         stage0_marker=stage0,

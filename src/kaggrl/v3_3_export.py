@@ -23,6 +23,11 @@ from .v3_3_schema import (
     STRATEGY_CORE_SCALE,
 )
 
+V33_EXCLUDED_TRAINING_PREFIXES = (
+    *EXCLUDED_TRAINING_PREFIXES,
+    "short_economic_head.",
+)
+
 
 def runtime_schema_sha256(strategy_count: int) -> str:
     payload = {
@@ -99,7 +104,7 @@ def export_v3_3_numpy(
     for name, tensor in model.state_dict().items():
         if (
             not include_training_heads
-            and name.startswith(EXCLUDED_TRAINING_PREFIXES)
+            and name.startswith(V33_EXCLUDED_TRAINING_PREFIXES)
         ):
             continue
         arrays["p__" + name.replace(".", "__")] = (

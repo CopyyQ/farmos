@@ -131,6 +131,7 @@ def _sample_quantity_argmax_tensor(
     positive: torch.Tensor,
     max_value: torch.Tensor,
     active: torch.Tensor,
+    max_steps: int | None = None,
 ) -> torch.Tensor:
     context = model.quantity_context(hidden)
     qhidden = model.quantity_decoder.initial_state(context)
@@ -149,7 +150,12 @@ def _sample_quantity_argmax_tensor(
     vocab = model.quantity_decoder.vocab_size
     token_ids = torch.arange(vocab, device=device)
 
-    for step_index in range(model.quantity_decoder.max_digits + 1):
+    decode_steps = (
+        model.quantity_decoder.max_digits + 1
+        if max_steps is None
+        else max(1, min(int(max_steps), model.quantity_decoder.max_digits + 1))
+    )
+    for step_index in range(decode_steps):
         logits, next_hidden = model.quantity_decoder.step(qhidden, previous)
         running = ~finished
         allowed = torch.zeros(
@@ -555,23 +561,26 @@ def teacher_step_tensor_mixed(
     unit_quantity_logits = []
     unit_legal_op_mask = []
 
-    unit_item_op_ids = torch.tensor(
-        [
-            UNIT_OP_TO_ID["PICKUP"],
-            UNIT_OP_TO_ID["PLACE"],
-            UNIT_OP_TO_ID["PLANT"],
-        ],
-        device=device,
-        dtype=torch.long,
-    )
-    unit_quantity_op_ids = torch.tensor(
-        [
-            UNIT_OP_TO_ID["PICKUP"],
-            UNIT_OP_TO_ID["PLACE"],
-        ],
-        device=device,
-        dtype=torch.long,
-    )
+    unit_item_op_ids = None
+    unit_quantity_op_ids = None
+    if not shared_conditioning_ledger:
+        unit_item_op_ids = torch.tensor(
+            [
+                UNIT_OP_TO_ID["PICKUP"],
+                UNIT_OP_TO_ID["PLACE"],
+                UNIT_OP_TO_ID["PLANT"],
+            ],
+            device=device,
+            dtype=torch.long,
+        )
+        unit_quantity_op_ids = torch.tensor(
+            [
+                UNIT_OP_TO_ID["PICKUP"],
+                UNIT_OP_TO_ID["PLACE"],
+            ],
+            device=device,
+            dtype=torch.long,
+        )
 
     for actor_index in range(target_device.max_units):
         active = target_device.unit_mask[:, actor_index]
@@ -609,62 +618,70 @@ def teacher_step_tensor_mixed(
         unit_quantity_logits.append(quantity_logits)
         unit_legal_op_mask.append(expert_legal.op_mask)
 
-        sampled_op = _masked_argmax(
-            op_logits, conditioning_legal.op_mask
-        )
-        sampled_item_mask = conditioning_legal.item_mask[
-            rows, sampled_op
-        ]
-        sampled_item = _masked_argmax(
-            item_logits, sampled_item_mask
-        )
-        needs_item = sampled_op.unsqueeze(1).eq(
-            unit_item_op_ids.unsqueeze(0)
-        ).any(dim=1)
-        sampled_item = torch.where(
-            needs_item, sampled_item, torch.zeros_like(sampled_item)
-        )
-        quantity_max = conditioning_legal.quantity_max[
-            rows,
-            sampled_op,
-            sampled_item.clamp(0, conditioning_legal.quantity_max.shape[-1] - 1),
-        ]
-        needs_quantity = sampled_op.unsqueeze(1).eq(
-            unit_quantity_op_ids.unsqueeze(0)
-        ).any(dim=1) & active
-        sampled_quantity = _sample_quantity_argmax_tensor(
-            model,
-            candidate_hidden,
-            positive=torch.zeros_like(active),
-            max_value=quantity_max,
-            active=needs_quantity,
-        )
-        sampled_quantity = torch.where(
-            needs_quantity,
-            sampled_quantity,
-            torch.full_like(sampled_quantity, -1),
-        )
+        if shared_conditioning_ledger:
+            conditioning_op = target_device.unit_op[:, actor_index]
+            conditioning_item = target_device.unit_item[:, actor_index]
+            conditioning_quantity = target_device.unit_quantity[:, actor_index]
+        else:
+            sampled_op = _masked_argmax(
+                op_logits, conditioning_legal.op_mask
+            )
+            sampled_item_mask = conditioning_legal.item_mask[
+                rows, sampled_op
+            ]
+            sampled_item = _masked_argmax(
+                item_logits, sampled_item_mask
+            )
+            needs_item = sampled_op.unsqueeze(1).eq(
+                unit_item_op_ids.unsqueeze(0)
+            ).any(dim=1)
+            sampled_item = torch.where(
+                needs_item, sampled_item, torch.zeros_like(sampled_item)
+            )
+            quantity_max = conditioning_legal.quantity_max[
+                rows,
+                sampled_op,
+                sampled_item.clamp(
+                    0, conditioning_legal.quantity_max.shape[-1] - 1
+                ),
+            ]
+            needs_quantity = sampled_op.unsqueeze(1).eq(
+                unit_quantity_op_ids.unsqueeze(0)
+            ).any(dim=1) & active
+            sampled_quantity = _sample_quantity_argmax_tensor(
+                model,
+                candidate_hidden,
+                positive=torch.zeros_like(active),
+                max_value=quantity_max,
+                active=needs_quantity,
+                max_steps=target_device.unit_quantity_tokens.shape[-1],
+            )
+            sampled_quantity = torch.where(
+                needs_quantity,
+                sampled_quantity,
+                torch.full_like(sampled_quantity, -1),
+            )
 
-        use_teacher = _teacher_choice_mask(
-            active,
-            teacher_mix_probability,
-            generator=generator,
-        )
-        conditioning_op = torch.where(
-            use_teacher,
-            target_device.unit_op[:, actor_index],
-            sampled_op,
-        )
-        conditioning_item = torch.where(
-            use_teacher,
-            target_device.unit_item[:, actor_index],
-            sampled_item,
-        )
-        conditioning_quantity = torch.where(
-            use_teacher,
-            target_device.unit_quantity[:, actor_index],
-            sampled_quantity,
-        )
+            use_teacher = _teacher_choice_mask(
+                active,
+                teacher_mix_probability,
+                generator=generator,
+            )
+            conditioning_op = torch.where(
+                use_teacher,
+                target_device.unit_op[:, actor_index],
+                sampled_op,
+            )
+            conditioning_item = torch.where(
+                use_teacher,
+                target_device.unit_item[:, actor_index],
+                sampled_item,
+            )
+            conditioning_quantity = torch.where(
+                use_teacher,
+                target_device.unit_quantity[:, actor_index],
+                sampled_quantity,
+            )
 
         decoder_hidden = torch.where(
             active.unsqueeze(-1),
@@ -706,21 +723,24 @@ def teacher_step_tensor_mixed(
     market_quantity_logits = []
     market_continue_legal_mask = []
     market_active_legal_mask = []
-    active_to_market = torch.tensor(
-        [MARKET_OP_TO_ID[name] for name in ACTIVE_MARKET_OPS],
-        device=device,
-        dtype=torch.long,
-    )
-    market_item_ops = torch.tensor(
-        [
-            MARKET_OP_TO_ID["BUY_SEED"],
-            MARKET_OP_TO_ID["BUY_PRODUCT"],
-            MARKET_OP_TO_ID["BUY_ANIMAL"],
-            MARKET_OP_TO_ID["SELL"],
-        ],
-        device=device,
-        dtype=torch.long,
-    )
+    active_to_market = None
+    market_item_ops = None
+    if not shared_conditioning_ledger:
+        active_to_market = torch.tensor(
+            [MARKET_OP_TO_ID[name] for name in ACTIVE_MARKET_OPS],
+            device=device,
+            dtype=torch.long,
+        )
+        market_item_ops = torch.tensor(
+            [
+                MARKET_OP_TO_ID["BUY_SEED"],
+                MARKET_OP_TO_ID["BUY_PRODUCT"],
+                MARKET_OP_TO_ID["BUY_ANIMAL"],
+                MARKET_OP_TO_ID["SELL"],
+            ],
+            device=device,
+            dtype=torch.long,
+        )
 
     for slot in range(target_device.market_op.shape[1]):
         active = target_device.market_mask[:, slot]
@@ -788,77 +808,85 @@ def teacher_step_tensor_mixed(
             expert_ledger.active_market_mask(expert_legal)
         )
 
-        conditioning_continue_mask = (
-            conditioning_ledger.continue_market_mask(conditioning_legal)
-        )
-        sampled_continue = _masked_argmax(
-            continue_logits, conditioning_continue_mask
-        )
-        conditioning_active_mask = (
-            conditioning_ledger.active_market_mask(conditioning_legal)
-        )
-        sampled_active_id = _masked_argmax(
-            active_logits, conditioning_active_mask
-        )
-        sampled_op = torch.where(
-            sampled_continue.eq(0),
-            torch.full_like(
-                sampled_active_id,
-                MARKET_OP_TO_ID["STOP_QUEUE"],
-            ),
-            active_to_market[sampled_active_id],
-        )
-        sampled_item_mask = conditioning_legal.item_mask[
-            rows, sampled_op
-        ]
-        sampled_item = _masked_argmax(
-            item_logits, sampled_item_mask
-        )
-        needs_item = sampled_op.unsqueeze(1).eq(
-            market_item_ops.unsqueeze(0)
-        ).any(dim=1)
-        sampled_item = torch.where(
-            needs_item, sampled_item, torch.zeros_like(sampled_item)
-        )
-        quantity_max = conditioning_legal.quantity_max[
-            rows,
-            sampled_op,
-            sampled_item.clamp(0, conditioning_legal.quantity_max.shape[-1] - 1),
-        ]
-        needs_quantity = needs_item & active
-        sampled_quantity = _sample_quantity_argmax_tensor(
-            model,
-            candidate_hidden,
-            positive=torch.ones_like(active),
-            max_value=quantity_max,
-            active=needs_quantity,
-        )
-        sampled_quantity = torch.where(
-            needs_quantity,
-            sampled_quantity,
-            torch.full_like(sampled_quantity, -1),
-        )
+        if shared_conditioning_ledger:
+            conditioning_op = target_device.market_op[:, slot]
+            conditioning_item = target_device.market_item[:, slot]
+            conditioning_quantity = target_device.market_quantity[:, slot]
+        else:
+            conditioning_continue_mask = (
+                conditioning_ledger.continue_market_mask(conditioning_legal)
+            )
+            sampled_continue = _masked_argmax(
+                continue_logits, conditioning_continue_mask
+            )
+            conditioning_active_mask = (
+                conditioning_ledger.active_market_mask(conditioning_legal)
+            )
+            sampled_active_id = _masked_argmax(
+                active_logits, conditioning_active_mask
+            )
+            sampled_op = torch.where(
+                sampled_continue.eq(0),
+                torch.full_like(
+                    sampled_active_id,
+                    MARKET_OP_TO_ID["STOP_QUEUE"],
+                ),
+                active_to_market[sampled_active_id],
+            )
+            sampled_item_mask = conditioning_legal.item_mask[
+                rows, sampled_op
+            ]
+            sampled_item = _masked_argmax(
+                item_logits, sampled_item_mask
+            )
+            needs_item = sampled_op.unsqueeze(1).eq(
+                market_item_ops.unsqueeze(0)
+            ).any(dim=1)
+            sampled_item = torch.where(
+                needs_item, sampled_item, torch.zeros_like(sampled_item)
+            )
+            quantity_max = conditioning_legal.quantity_max[
+                rows,
+                sampled_op,
+                sampled_item.clamp(
+                    0, conditioning_legal.quantity_max.shape[-1] - 1
+                ),
+            ]
+            needs_quantity = needs_item & active
+            sampled_quantity = _sample_quantity_argmax_tensor(
+                model,
+                candidate_hidden,
+                positive=torch.ones_like(active),
+                max_value=quantity_max,
+                active=needs_quantity,
+                max_steps=target_device.market_quantity_tokens.shape[-1],
+            )
+            sampled_quantity = torch.where(
+                needs_quantity,
+                sampled_quantity,
+                torch.full_like(sampled_quantity, -1),
+            )
 
-        use_teacher = _teacher_choice_mask(
-            active,
-            teacher_mix_probability,
-            generator=generator,
-        )
-        conditioning_op = torch.where(
-            use_teacher,
-            target_device.market_op[:, slot],
-            sampled_op,
-        )
-        conditioning_item = torch.where(
-            use_teacher,
-            target_device.market_item[:, slot],
-            sampled_item,
-        )
-        conditioning_quantity = torch.where(
-            use_teacher,
-            target_device.market_quantity[:, slot],
-            sampled_quantity,
-        )
+            use_teacher = _teacher_choice_mask(
+                active,
+                teacher_mix_probability,
+                generator=generator,
+            )
+            conditioning_op = torch.where(
+                use_teacher,
+                target_device.market_op[:, slot],
+                sampled_op,
+            )
+            conditioning_item = torch.where(
+                use_teacher,
+                target_device.market_item[:, slot],
+                sampled_item,
+            )
+            conditioning_quantity = torch.where(
+                use_teacher,
+                target_device.market_quantity[:, slot],
+                sampled_quantity,
+            )
 
         decoder_hidden = torch.where(
             active.unsqueeze(-1),

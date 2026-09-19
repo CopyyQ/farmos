@@ -155,15 +155,11 @@ def _market_semantic_loss(
         targets.market_mask
         & ~is_stop
     ).to(torch.long)
-    future_count = torch.zeros_like(active_future)
-    running = torch.zeros(
-        market_op.shape[0],
-        device=market_op.device,
-        dtype=torch.long,
+    reverse_cumulative = torch.flip(
+        torch.cumsum(torch.flip(active_future, dims=(1,)), dim=1),
+        dims=(1,),
     )
-    for slot in range(market_op.shape[1] - 1, -1, -1):
-        future_count[:, slot] = running
-        running = running + active_future[:, slot]
+    future_count = reverse_cumulative - active_future
     queue_weight = torch.minimum(
         torch.full_like(continue_ce, 3.0),
         1.0 + 0.35 * future_count.to(continue_ce.dtype),
@@ -187,13 +183,12 @@ def _market_semantic_loss(
     continue_weight[:, 0] *= phase_continue
     result = continue_ce * continue_weight
 
-    active_id = torch.zeros_like(market_op)
-    for op, active_index in ACTIVE_MARKET_OP_TO_ID.items():
-        active_id = torch.where(
-            market_op.eq(MARKET_OP_TO_ID[op]),
-            torch.full_like(active_id, active_index),
-            active_id,
-        )
+    active_index_lookup = torch.tensor(
+        [int(ACTIVE_MARKET_OP_TO_ID.get(op, 0)) for op in MARKET_OPS],
+        device=market_op.device,
+        dtype=torch.long,
+    )
+    active_id = active_index_lookup[market_op]
     active_ce = F.cross_entropy(
         outputs.market_active_logits.flatten(0, 1),
         active_id.reshape(-1),
