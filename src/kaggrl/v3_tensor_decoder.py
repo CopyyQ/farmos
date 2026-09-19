@@ -37,6 +37,15 @@ class TensorTeacherPolicyOutput:
     temporal_diagnostics: TemporalDiagnostics
 
 
+
+def _module_fp32(module, value: torch.Tensor) -> torch.Tensor:
+    with torch.autocast(
+        device_type=value.device.type,
+        enabled=False,
+    ):
+        return module(value.float())
+
+
 def _signed_log1p_tensor(value: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     value = value.to(dtype)
     return torch.sign(value) * torch.log1p(value.abs())
@@ -60,21 +69,30 @@ def semantic_embedding_tensor(
         op_index = 1 + len(UNIT_OPS) + op
     else:
         raise ValueError(f"unknown action domain: {domain}")
-    omitted = quantity.lt(0)
-    quantity_features = torch.stack([
-        omitted.to(ref.dtype),
-        _signed_log1p_tensor(
-            torch.where(omitted, torch.zeros_like(quantity), quantity),
-            ref.dtype,
-        ),
-    ], dim=-1)
-    op_emb = model.op_embedding(op_index)
-    item_emb = model.item_embedding(item)
-    return model.action_proj(torch.cat([
-        op_emb.to(ref),
-        item_emb.to(ref),
-        quantity_features,
-    ], dim=-1))
+    with torch.autocast(
+        device_type=ref.device.type,
+        enabled=False,
+    ):
+        ref_fp32 = ref.float()
+        omitted = quantity.lt(0)
+        quantity_features = torch.stack([
+            omitted.to(torch.float32),
+            _signed_log1p_tensor(
+                torch.where(
+                    omitted,
+                    torch.zeros_like(quantity),
+                    quantity,
+                ),
+                torch.float32,
+            ),
+        ], dim=-1)
+        op_emb = model.op_embedding(op_index).float()
+        item_emb = model.item_embedding(item).float()
+        return model.action_proj(torch.cat([
+            op_emb.to(ref_fp32),
+            item_emb.to(ref_fp32),
+            quantity_features.to(ref_fp32),
+        ], dim=-1))
 
 
 def _decode_input_tensor(
@@ -89,20 +107,30 @@ def _decode_input_tensor(
     remaining_units: torch.Tensor,
     remaining_market: torch.Tensor,
 ) -> torch.Tensor:
-    ledger_ctx = model.ledger_proj(ledger.ledger_vector(actor_ctx))
-    tail = torch.stack([
-        remaining_units.to(actor_ctx),
-        remaining_market.to(actor_ctx),
-    ], dim=-1)
-    decoder_input = torch.cat([
-        actor_ctx,
-        previous,
-        ledger_ctx,
-        global_h,
-        intent,
-        tail,
-    ], dim=-1)
-    return model.decoder_cell(decoder_input, hidden)
+    with torch.autocast(
+        device_type=actor_ctx.device.type,
+        enabled=False,
+    ):
+        actor_ctx_fp32 = actor_ctx.float()
+        ledger_ctx = model.ledger_proj(
+            ledger.ledger_vector(actor_ctx_fp32).float()
+        )
+        tail = torch.stack([
+            remaining_units.float(),
+            remaining_market.float(),
+        ], dim=-1)
+        decoder_input = torch.cat([
+            actor_ctx_fp32,
+            previous.float(),
+            ledger_ctx.float(),
+            global_h.float(),
+            intent.float(),
+            tail,
+        ], dim=-1)
+        return model.decoder_cell(
+            decoder_input,
+            hidden.float(),
+        )
 
 
 def _teacher_quantity_logits_tensor(
@@ -111,12 +139,16 @@ def _teacher_quantity_logits_tensor(
     tokens: torch.Tensor,
     token_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    context = model.quantity_context(hidden)
-    return model.quantity_decoder.teacher_logits_tensor(
-        context,
-        tokens,
-        token_mask,
-    )
+    with torch.autocast(
+        device_type=hidden.device.type,
+        enabled=False,
+    ):
+        context = model.quantity_context(hidden.float())
+        return model.quantity_decoder.teacher_logits_tensor(
+            context,
+            tokens,
+            token_mask,
+        )
 
 
 def _masked_argmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -133,8 +165,17 @@ def _sample_quantity_argmax_tensor(
     active: torch.Tensor,
     max_steps: int | None = None,
 ) -> torch.Tensor:
-    context = model.quantity_context(hidden)
-    qhidden = model.quantity_decoder.initial_state(context)
+    context = _module_fp32(
+        model.quantity_context,
+        hidden,
+    )
+    with torch.autocast(
+        device_type=hidden.device.type,
+        enabled=False,
+    ):
+        qhidden = model.quantity_decoder.initial_state(
+            context.float()
+        )
     batch = hidden.shape[0]
     device = hidden.device
     previous = torch.full(
@@ -156,7 +197,14 @@ def _sample_quantity_argmax_tensor(
         else max(1, min(int(max_steps), model.quantity_decoder.max_digits + 1))
     )
     for step_index in range(decode_steps):
-        logits, next_hidden = model.quantity_decoder.step(qhidden, previous)
+        with torch.autocast(
+            device_type=hidden.device.type,
+            enabled=False,
+        ):
+            logits, next_hidden = model.quantity_decoder.step(
+                qhidden.float(),
+                previous,
+            )
         running = ~finished
         allowed = torch.zeros(
             (batch, vocab), dtype=torch.bool, device=device,
@@ -275,9 +323,10 @@ def teacher_step_tensor(
     if ledger.device != device:
         ledger = ledger.to(device)
 
-    decoder_hidden = model.decoder_init(torch.cat([
-        fused_temporal, intent,
-    ], dim=-1))
+    decoder_hidden = _module_fp32(
+        model.decoder_init,
+        torch.cat([fused_temporal, intent], dim=-1),
+    )
     previous_emb = model.start_action.to(fused_temporal).unsqueeze(0).expand(
         batch_size, -1
     )
@@ -312,8 +361,8 @@ def teacher_step_tensor(
             remaining_units=remaining_units,
             remaining_market=remaining_market,
         )
-        op_logits = model.unit_op_head(candidate_hidden)
-        item_logits = model.item_head(candidate_hidden)
+        op_logits = _module_fp32(model.unit_op_head, candidate_hidden)
+        item_logits = _module_fp32(model.item_head, candidate_hidden)
         quantity_logits, _ = _teacher_quantity_logits_tensor(
             model,
             candidate_hidden,
@@ -387,8 +436,8 @@ def teacher_step_tensor(
             remaining_units=remaining_units,
             remaining_market=remaining_market,
         )
-        continue_logits = model.market_continue_head(candidate_hidden)
-        active_logits = model.market_active_op_head(candidate_hidden)
+        continue_logits = _module_fp32(model.market_continue_head, candidate_hidden)
+        active_logits = _module_fp32(model.market_active_op_head, candidate_hidden)
         economic_hook = getattr(model, "_economic_market_residual", None)
         if callable(economic_hook):
             economic_continue, economic_active = economic_hook(
@@ -397,8 +446,9 @@ def teacher_step_tensor(
             continue_logits = continue_logits + economic_continue
             active_logits = active_logits + economic_active
         if slot == 0 and strategy_context is not None:
-            opening_residual = model.opening_strategy_head(
-                strategy_context
+            opening_residual = _module_fp32(
+                model.opening_strategy_head,
+                strategy_context,
             )
             opening_mask = ledger.step.eq(0).to(
                 active_logits.dtype
@@ -409,7 +459,7 @@ def teacher_step_tensor(
                 * float(OPENING_ACTIVE_INTENT_SCALE)
                 * opening_residual
             )
-        item_logits = model.item_head(candidate_hidden)
+        item_logits = _module_fp32(model.item_head, candidate_hidden)
         quantity_logits, _ = _teacher_quantity_logits_tensor(
             model,
             candidate_hidden,
@@ -548,9 +598,10 @@ def teacher_step_tensor_mixed(
     )
     batch_size = targets.batch_size
     rows = torch.arange(batch_size, device=device)
-    decoder_hidden = model.decoder_init(torch.cat([
-        fused_temporal, intent,
-    ], dim=-1))
+    decoder_hidden = _module_fp32(
+        model.decoder_init,
+        torch.cat([fused_temporal, intent], dim=-1),
+    )
     previous_emb = model.start_action.to(fused_temporal).unsqueeze(0).expand(
         batch_size, -1
     )
@@ -605,8 +656,8 @@ def teacher_step_tensor_mixed(
             remaining_units=remaining_units,
             remaining_market=remaining_market,
         )
-        op_logits = model.unit_op_head(candidate_hidden)
-        item_logits = model.item_head(candidate_hidden)
+        op_logits = _module_fp32(model.unit_op_head, candidate_hidden)
+        item_logits = _module_fp32(model.item_head, candidate_hidden)
         quantity_logits, _ = _teacher_quantity_logits_tensor(
             model,
             candidate_hidden,
@@ -768,8 +819,8 @@ def teacher_step_tensor_mixed(
                 dtype=fused_temporal.dtype,
             ),
         )
-        continue_logits = model.market_continue_head(candidate_hidden)
-        active_logits = model.market_active_op_head(candidate_hidden)
+        continue_logits = _module_fp32(model.market_continue_head, candidate_hidden)
+        active_logits = _module_fp32(model.market_active_op_head, candidate_hidden)
         economic_hook = getattr(model, "_economic_market_residual", None)
         if callable(economic_hook):
             economic_continue, economic_active = economic_hook(
@@ -778,8 +829,9 @@ def teacher_step_tensor_mixed(
             continue_logits = continue_logits + economic_continue
             active_logits = active_logits + economic_active
         if slot == 0 and strategy_context is not None:
-            opening_residual = model.opening_strategy_head(
-                strategy_context
+            opening_residual = _module_fp32(
+                model.opening_strategy_head,
+                strategy_context,
             )
             opening_mask = expert_ledger.step.eq(0).to(
                 active_logits.dtype
@@ -790,7 +842,7 @@ def teacher_step_tensor_mixed(
                 * float(OPENING_ACTIVE_INTENT_SCALE)
                 * opening_residual
             )
-        item_logits = model.item_head(candidate_hidden)
+        item_logits = _module_fp32(model.item_head, candidate_hidden)
         quantity_logits, _ = _teacher_quantity_logits_tensor(
             model,
             candidate_hidden,

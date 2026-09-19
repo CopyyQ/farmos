@@ -60,21 +60,68 @@ def _op_weight_lookup(
     return torch.tensor(values, device=device, dtype=dtype)
 
 
+
+def _masked_ce_per_decision(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    if logits.shape[:-1] != targets.shape or targets.shape != mask.shape:
+        raise ValueError("masked CE shape mismatch")
+    result = torch.zeros(
+        targets.shape,
+        device=logits.device,
+        dtype=torch.float32,
+    )
+    active = mask.to(device=logits.device, dtype=torch.bool)
+    if not bool(active.any().item()):
+        return result
+    result[active] = F.cross_entropy(
+        logits[active].float(),
+        targets[active],
+        reduction="none",
+    )
+    return result
+
+
 def _quantity_loss_per_decision(
     logits: torch.Tensor,
     targets: torch.Tensor,
     token_mask: torch.Tensor,
+    decision_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if logits.ndim < 3:
         raise ValueError("quantity logits must end in [tokens, vocab]")
-    vocab = logits.shape[-1]
+    decision_shape = targets.shape[:-1]
+    result = torch.zeros(
+        decision_shape,
+        device=logits.device,
+        dtype=torch.float32,
+    )
+    active = (
+        token_mask.any(dim=-1)
+        if decision_mask is None
+        else (decision_mask.to(torch.bool) & token_mask.any(dim=-1))
+    )
+    if not bool(active.any().item()):
+        return result
+
+    selected_logits = logits[active].float()
+    selected_targets = targets[active]
+    selected_mask = token_mask[active]
+    vocab = selected_logits.shape[-1]
     flat_loss = F.cross_entropy(
-        logits.float().reshape(-1, vocab),
-        targets.reshape(-1),
+        selected_logits.reshape(-1, vocab),
+        selected_targets.reshape(-1),
         reduction="none",
-    ).reshape(targets.shape)
-    mask = token_mask.to(flat_loss.dtype)
-    return (flat_loss * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
+    ).reshape(selected_targets.shape)
+    mask = selected_mask.to(flat_loss.dtype)
+    selected_loss = (
+        (flat_loss * mask).sum(dim=-1)
+        / mask.sum(dim=-1).clamp_min(1.0)
+    )
+    result[active] = selected_loss
+    return result
 
 
 def _unit_semantic_loss(
@@ -87,11 +134,11 @@ def _unit_semantic_loss(
 ) -> torch.Tensor:
     # [B,U]
     op_target = targets.unit_op
-    op_ce = F.cross_entropy(
-        op_logits.float().flatten(0, 1),
-        op_target.reshape(-1),
-        reduction="none",
-    ).reshape(op_target.shape)
+    op_ce = _masked_ce_per_decision(
+        op_logits,
+        op_target,
+        targets.unit_mask,
+    )
     lookup = _op_weight_lookup(
         domain="unit",
         names=UNIT_OPS,
@@ -101,35 +148,42 @@ def _unit_semantic_loss(
     )
     loss = op_ce * lookup[op_target]
 
-    item_ce = F.cross_entropy(
-        item_logits.float().flatten(0, 1),
-        targets.unit_item.reshape(-1),
-        reduction="none",
-    ).reshape(op_target.shape)
     item_ids = torch.tensor(
         [UNIT_OP_TO_ID[name] for name in UNIT_ITEM_OPS],
         device=op_logits.device,
         dtype=torch.long,
     )
-    needs_item = op_target.unsqueeze(-1).eq(
-        item_ids.view(1, 1, -1)
-    ).any(dim=-1)
-    loss = loss + 0.5 * item_ce * needs_item.to(loss.dtype)
-
-    quantity_ce = _quantity_loss_per_decision(
-        quantity_logits,
-        targets.unit_quantity_tokens,
-        targets.unit_quantity_token_mask,
+    needs_item = (
+        op_target.unsqueeze(-1).eq(
+            item_ids.view(1, 1, -1)
+        ).any(dim=-1)
+        & targets.unit_mask
     )
+    item_ce = _masked_ce_per_decision(
+        item_logits,
+        targets.unit_item,
+        needs_item,
+    )
+    loss = loss + 0.5 * item_ce
+
     quantity_ids = torch.tensor(
         [UNIT_OP_TO_ID[name] for name in UNIT_QUANTITY_OPS],
         device=op_logits.device,
         dtype=torch.long,
     )
-    needs_quantity = op_target.unsqueeze(-1).eq(
-        quantity_ids.view(1, 1, -1)
-    ).any(dim=-1)
-    loss = loss + 0.25 * quantity_ce * needs_quantity.to(loss.dtype)
+    needs_quantity = (
+        op_target.unsqueeze(-1).eq(
+            quantity_ids.view(1, 1, -1)
+        ).any(dim=-1)
+        & targets.unit_mask
+    )
+    quantity_ce = _quantity_loss_per_decision(
+        quantity_logits,
+        targets.unit_quantity_tokens,
+        targets.unit_quantity_token_mask,
+        decision_mask=needs_quantity,
+    )
+    loss = loss + 0.25 * quantity_ce
     return loss
 
 
@@ -145,11 +199,11 @@ def _market_semantic_loss(
     market_op = targets.market_op
     is_stop = market_op.eq(STOP_ID)
     continue_target = (~is_stop).long()
-    continue_ce = F.cross_entropy(
-        outputs.market_continue_logits.float().flatten(0, 1),
-        continue_target.reshape(-1),
-        reduction="none",
-    ).reshape(market_op.shape)
+    continue_ce = _masked_ce_per_decision(
+        outputs.market_continue_logits,
+        continue_target,
+        targets.market_mask,
+    )
 
     active_future = (
         targets.market_mask
@@ -189,11 +243,12 @@ def _market_semantic_loss(
         dtype=torch.long,
     )
     active_id = active_index_lookup[market_op]
-    active_ce = F.cross_entropy(
-        outputs.market_active_logits.float().flatten(0, 1),
-        active_id.reshape(-1),
-        reduction="none",
-    ).reshape(market_op.shape)
+    active_mask = targets.market_mask & ~is_stop
+    active_ce = _masked_ce_per_decision(
+        outputs.market_active_logits,
+        active_id,
+        active_mask,
+    )
 
     active_lookup = torch.ones(
         len(ACTIVE_MARKET_OPS),
@@ -226,43 +281,44 @@ def _market_semantic_loss(
         torch.full_like(active_weight[:, 0], 32.0),
         active_weight[:, 0],
     )
-    result = result + (
-        active_ce
-        * active_weight
-        * (~is_stop).to(active_ce.dtype)
-    )
+    result = result + active_ce * active_weight
 
-    item_ce = F.cross_entropy(
-        outputs.market_item_logits.float().flatten(0, 1),
-        targets.market_item.reshape(-1),
-        reduction="none",
-    ).reshape(market_op.shape)
     item_ids = torch.tensor(
         [MARKET_OP_TO_ID[name] for name in MARKET_ITEM_OPS],
         device=market_op.device,
         dtype=torch.long,
     )
-    needs_item = market_op.unsqueeze(-1).eq(
-        item_ids.view(1, 1, -1)
-    ).any(dim=-1)
-    result = result + 0.5 * item_ce * needs_item.to(result.dtype)
-
-    quantity_ce = _quantity_loss_per_decision(
-        outputs.market_quantity_logits,
-        targets.market_quantity_tokens,
-        targets.market_quantity_token_mask,
+    needs_item = (
+        market_op.unsqueeze(-1).eq(
+            item_ids.view(1, 1, -1)
+        ).any(dim=-1)
+        & targets.market_mask
     )
+    item_ce = _masked_ce_per_decision(
+        outputs.market_item_logits,
+        targets.market_item,
+        needs_item,
+    )
+    result = result + 0.5 * item_ce
+
     quantity_ids = torch.tensor(
         [MARKET_OP_TO_ID[name] for name in MARKET_QUANTITY_OPS],
         device=market_op.device,
         dtype=torch.long,
     )
-    needs_quantity = market_op.unsqueeze(-1).eq(
-        quantity_ids.view(1, 1, -1)
-    ).any(dim=-1)
-    result = result + (
-        0.25 * quantity_ce * needs_quantity.to(result.dtype)
+    needs_quantity = (
+        market_op.unsqueeze(-1).eq(
+            quantity_ids.view(1, 1, -1)
+        ).any(dim=-1)
+        & targets.market_mask
     )
+    quantity_ce = _quantity_loss_per_decision(
+        outputs.market_quantity_logits,
+        targets.market_quantity_tokens,
+        targets.market_quantity_token_mask,
+        decision_mask=needs_quantity,
+    )
+    result = result + 0.25 * quantity_ce
     return result
 
 

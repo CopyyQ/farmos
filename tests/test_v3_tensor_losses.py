@@ -102,6 +102,49 @@ def test_tensor_total_pretrain_loss_matches_legacy_default_objective():
         ), (key, tensor[key], legacy[key])
 
 
+
+def test_tensor_loss_ignores_nan_in_inactive_semantic_heads():
+    torch.manual_seed(61)
+    batch = _make_batch(step=123)
+    model = TemporalIntentPolicyV32(strategy_count=0).eval()
+    targets = TensorActionTargets.from_actions(
+        batch.canonical_actions,
+        max_units=batch.own_units.shape[1],
+    )
+    ledger = TensorLedger.from_states(batch.structured_states)
+    with torch.no_grad():
+        output = teacher_step_tensor(
+            model,
+            batch,
+            targets,
+            ledger,
+            state=None,
+        )
+
+        # STOP_QUEUE never uses the active-op head.
+        output.market_active_logits[:, 1, :] = float("nan")
+        # HIRE/STOP_QUEUE do not use item or quantity heads.
+        output.market_item_logits[1, 0, :] = float("nan")
+        output.market_item_logits[:, 1, :] = float("nan")
+        output.market_quantity_logits[1, 0, :, :] = float("nan")
+        output.market_quantity_logits[:, 1, :, :] = float("nan")
+
+        # PASS/EAST do not use unit item/quantity heads.
+        output.unit_item_logits[:, 0, :] = float("nan")
+        output.unit_quantity_logits[:, 0, :, :] = float("nan")
+
+        losses = tensor_total_pretrain_loss(
+            output,
+            batch,
+            targets,
+            step=ledger.step,
+        )
+
+    assert torch.isfinite(losses["market"])
+    assert torch.isfinite(losses["action"])
+    assert torch.isfinite(losses["total"])
+
+
 def test_tensor_total_pretrain_loss_matches_step0_market_weighting():
     torch.manual_seed(59)
     batch = _make_batch(step=0)

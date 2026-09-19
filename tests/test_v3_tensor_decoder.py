@@ -264,6 +264,54 @@ def test_tensor_teacher_decoder_matches_opening_strategy_residual():
     )
 
 
+
+def test_tensor_decoder_heads_stay_fp32_under_autocast():
+    row = _row(
+        1,
+        _unit("EAST"),
+        [_unit("PASS")],
+        [_order("BUY_SEED", "WHEAT", 1), _stop()],
+    )
+    batch = collate_transitions([row])
+    model = TemporalIntentPolicyV32(strategy_count=0).eval()
+    targets = TensorActionTargets.from_actions(
+        batch.canonical_actions,
+        max_units=batch.own_units.shape[1],
+    )
+    ledger = TensorLedger.from_states(batch.structured_states)
+
+    with torch.no_grad(), torch.autocast(
+        device_type="cpu",
+        dtype=torch.bfloat16,
+        enabled=True,
+    ):
+        output = teacher_step_tensor(
+            model,
+            batch,
+            targets,
+            ledger,
+            state=None,
+        )
+
+    assert output.unit_op_logits.dtype == torch.float32
+    assert output.unit_item_logits.dtype == torch.float32
+    assert output.unit_quantity_logits.dtype == torch.float32
+    assert output.market_continue_logits.dtype == torch.float32
+    assert output.market_active_logits.dtype == torch.float32
+    assert output.market_item_logits.dtype == torch.float32
+    assert output.market_quantity_logits.dtype == torch.float32
+    for tensor in (
+        output.unit_op_logits,
+        output.unit_item_logits,
+        output.unit_quantity_logits,
+        output.market_continue_logits,
+        output.market_active_logits,
+        output.market_item_logits,
+        output.market_quantity_logits,
+    ):
+        assert torch.isfinite(tensor).all()
+
+
 def test_tensor_mixed_full_teacher_skips_sampling_path(monkeypatch):
     import kaggrl.v3_tensor_decoder as decoder_module
 
