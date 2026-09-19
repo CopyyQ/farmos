@@ -125,6 +125,9 @@ class BCV3Config:
     selection_mode: str = "offline_legacy"
     clear_cuda_cache: bool = True
     gpu_tensor_training: bool = False
+    gpu_batch_cache: bool = False
+    gpu_batch_cache_reserve_gb: float = 3.0
+    gpu_batch_cache_pin_cpu: bool = True
 
     def validate(self) -> None:
         if self.sequence_len <= 0 or self.batch_sequences <= 0:
@@ -154,6 +157,10 @@ class BCV3Config:
             raise ValueError("unsupported V3 model_architecture")
         if self.gpu_tensor_training and self.model_architecture != V32_ARCHITECTURE_VERSION:
             raise ValueError("gpu_tensor_training currently requires V3.2")
+        if self.gpu_batch_cache and not self.gpu_tensor_training:
+            raise ValueError("gpu_batch_cache requires gpu_tensor_training")
+        if float(self.gpu_batch_cache_reserve_gb) < 0.5:
+            raise ValueError("gpu_batch_cache_reserve_gb must be >= 0.5")
         if self.model_architecture == V32_ARCHITECTURE_VERSION:
             if not self.strategy_conditioning:
                 raise ValueError("V3.2 requires strategy_conditioning")
@@ -636,6 +643,273 @@ def _teacher_chunk_tensor_sequence(
     return losses, states
 
 
+@dataclass
+class _CachedTensorSequence:
+    slots: tuple[int, ...]
+    steps: int
+    flat: StepBatch
+    targets: TensorActionTargets
+    ledger: TensorLedger
+    strategy_slots: torch.Tensor | None
+    resident_on_device: bool
+    tensor_bytes: int
+
+
+@dataclass
+class _PreparedTrainingUpdate:
+    active: tuple[tuple[int, SequenceChunk], ...]
+    cached: _CachedTensorSequence | None
+
+
+@dataclass
+class _PreparedTrainingGroup:
+    slot_count: int
+    updates: tuple[_PreparedTrainingUpdate, ...]
+
+
+def _tensor_bytes(value) -> int:
+    if torch.is_tensor(value):
+        return int(value.numel()) * int(value.element_size())
+    if isinstance(value, dict):
+        return sum(_tensor_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_bytes(item) for item in value)
+    if isinstance(value, StepBatch):
+        total = sum(
+            _tensor_bytes(getattr(value, field.name))
+            for field in fields(value)
+        )
+        total += _tensor_bytes(getattr(value, "auxiliary_targets", None))
+        total += _tensor_bytes(getattr(value, "sample_weight", None))
+        return total
+    if hasattr(value, "__dataclass_fields__"):
+        return sum(_tensor_bytes(getattr(value, field.name)) for field in fields(value))
+    return 0
+
+
+def _step_batch_to_device(
+    batch: StepBatch,
+    device: torch.device | str,
+    *,
+    non_blocking: bool = False,
+) -> StepBatch:
+    device = torch.device(device)
+    payload = {}
+    for field in fields(batch):
+        value = getattr(batch, field.name)
+        payload[field.name] = (
+            value.to(device, non_blocking=non_blocking)
+            if torch.is_tensor(value)
+            else value
+        )
+    result = StepBatch(**payload)
+    auxiliary = getattr(batch, "auxiliary_targets", None)
+    if isinstance(auxiliary, dict):
+        result.auxiliary_targets = {
+            key: (
+                value.to(device, non_blocking=non_blocking)
+                if torch.is_tensor(value)
+                else value
+            )
+            for key, value in auxiliary.items()
+        }
+    sample_weight = getattr(batch, "sample_weight", None)
+    if torch.is_tensor(sample_weight):
+        result.sample_weight = sample_weight.to(
+            device, non_blocking=non_blocking,
+        )
+    return result
+
+
+def _dataclass_to_device(value, device, *, non_blocking: bool = False):
+    device = torch.device(device)
+    payload = {}
+    for field in fields(value):
+        item = getattr(value, field.name)
+        payload[field.name] = (
+            item.to(device, non_blocking=non_blocking)
+            if torch.is_tensor(item)
+            else item
+        )
+    return type(value)(**payload)
+
+
+def _pin_step_batch(batch: StepBatch) -> StepBatch:
+    for field in fields(batch):
+        value = getattr(batch, field.name)
+        if torch.is_tensor(value) and value.device.type == "cpu":
+            setattr(batch, field.name, value.pin_memory())
+    auxiliary = getattr(batch, "auxiliary_targets", None)
+    if isinstance(auxiliary, dict):
+        batch.auxiliary_targets = {
+            key: (
+                value.pin_memory()
+                if torch.is_tensor(value) and value.device.type == "cpu"
+                else value
+            )
+            for key, value in auxiliary.items()
+        }
+    sample_weight = getattr(batch, "sample_weight", None)
+    if torch.is_tensor(sample_weight) and sample_weight.device.type == "cpu":
+        batch.sample_weight = sample_weight.pin_memory()
+    return batch
+
+
+def _pin_tensor_dataclass(value):
+    for field in fields(value):
+        item = getattr(value, field.name)
+        if torch.is_tensor(item) and item.device.type == "cpu":
+            setattr(value, field.name, item.pin_memory())
+    return value
+
+
+def _strip_step_batch_python(batch: StepBatch) -> StepBatch:
+    batch.structured_states = ()
+    batch.canonical_actions = ()
+    batch.previous_actions = ()
+    batch.effects_targets = ()
+    return batch
+
+
+def _materialize_cached_sequence(
+    cached: _CachedTensorSequence,
+    device: torch.device | str,
+):
+    device = torch.device(device)
+    if cached.resident_on_device:
+        return (
+            cached.flat,
+            cached.targets,
+            cached.ledger,
+            cached.strategy_slots,
+        )
+    non_blocking = bool(device.type == "cuda")
+    flat = _step_batch_to_device(
+        cached.flat, device, non_blocking=non_blocking,
+    )
+    targets = _dataclass_to_device(
+        cached.targets, device, non_blocking=non_blocking,
+    )
+    ledger = _dataclass_to_device(
+        cached.ledger, device, non_blocking=non_blocking,
+    )
+    strategy_slots = cached.strategy_slots
+    if torch.is_tensor(strategy_slots):
+        strategy_slots = strategy_slots.to(
+            device, non_blocking=non_blocking,
+        )
+    return flat, targets, ledger, strategy_slots
+
+
+def _teacher_cached_tensor_sequence(
+    model,
+    cached: _CachedTensorSequence,
+    states,
+    device,
+    *,
+    family_weights=None,
+    market_active_op_weights=None,
+    teacher_mix_probability=1.0,
+    conditioning_rng=None,
+    recurrent_stats=None,
+):
+    batch_size = len(cached.slots)
+    steps = int(cached.steps)
+    slots = list(cached.slots)
+    packed = _pack_states(states, slots)
+    flat, tensor_targets, tensor_ledger, strategy_slots = (
+        _materialize_cached_sequence(cached, device)
+    )
+    seed = 0
+    if conditioning_rng is not None and hasattr(conditioning_rng, "integers"):
+        seed = int(conditioning_rng.integers(0, 2**31 - 1))
+    generator_device = (
+        device.type if isinstance(device, torch.device)
+        else torch.device(device).type
+    )
+    tensor_generator = torch.Generator(device=generator_device)
+    tensor_generator.manual_seed(seed)
+
+    encoded = model.encoder(flat)
+    strategy_context = None
+    core_input = encoded.fused
+    if strategy_slots is not None:
+        if getattr(model, "strategy_embedding", None) is None:
+            raise RuntimeError(
+                "strategy-conditioned cached path needs an embedding"
+            )
+        strategy_context = model.strategy_embedding(
+            strategy_slots
+        ).to(encoded.fused)
+        core_context = torch.cat(
+            [strategy_context, strategy_context], dim=-1,
+        )
+        if core_context.shape != encoded.fused.shape:
+            raise RuntimeError("strategy core context shape mismatch")
+        core_input = (
+            encoded.fused
+            + float(STRATEGY_CORE_SCALE) * core_context
+        )
+
+    def bt(value):
+        return value.reshape(
+            batch_size, steps, *value.shape[1:],
+        )
+
+    fused_seq, base_intent_seq, next_state, diagnostics = model.core.sequence(
+        bt(core_input),
+        bt(flat.previous_action_global),
+        bt(flat.previous_effect),
+        bt(flat.economy),
+        packed,
+    )
+    fused_flat = fused_seq.reshape(batch_size * steps, -1)
+    base_intent_flat = base_intent_seq.reshape(batch_size * steps, -1)
+    intent_flat = (
+        base_intent_flat
+        if strategy_context is None
+        else base_intent_flat + strategy_context
+    )
+    output = teacher_step_tensor_mixed(
+        model,
+        flat,
+        tensor_targets,
+        tensor_ledger,
+        packed,
+        strategy_slots=strategy_slots,
+        teacher_mix_probability=teacher_mix_probability,
+        generator=tensor_generator,
+        precomputed={
+            "encoded": encoded,
+            "fused_temporal": fused_flat,
+            "intent": intent_flat,
+            "temporal_state": next_state,
+            "temporal_diagnostics": diagnostics,
+            "strategy_context": strategy_context,
+        },
+    )
+    losses = tensor_total_pretrain_loss_sequence(
+        output,
+        flat,
+        tensor_targets,
+        step=tensor_ledger.step,
+        batch_size=batch_size,
+        steps=steps,
+        family_weights=family_weights,
+        market_active_op_weights=market_active_op_weights,
+    )
+    _store_state(states, slots, next_state)
+    if recurrent_stats is not None:
+        recurrent_stats["temporal_steps"] += batch_size * steps
+        recurrent_stats["tensor_sequence_chunks"] = (
+            int(recurrent_stats.get("tensor_sequence_chunks", 0)) + 1
+        )
+        recurrent_stats["cached_tensor_sequence_chunks"] = (
+            int(recurrent_stats.get("cached_tensor_sequence_chunks", 0)) + 1
+        )
+    return losses, states
+
+
 def _teacher_chunk_cached(
     model, active_chunks, states, device, recurrent_stats=None,
     strategy_manifest: StrategyManifest | None = None,
@@ -645,6 +919,18 @@ def _teacher_chunk_cached(
     conditioning_rng=None,
     gpu_tensor_training: bool = False,
 ):
+    if isinstance(active_chunks, _CachedTensorSequence):
+        return _teacher_cached_tensor_sequence(
+            model,
+            active_chunks,
+            states,
+            device,
+            family_weights=family_weights,
+            market_active_op_weights=market_active_op_weights,
+            teacher_mix_probability=teacher_mix_probability,
+            conditioning_rng=conditioning_rng,
+            recurrent_stats=recurrent_stats,
+        )
     chunks = [chunk for _, chunk in active_chunks]
     max_len = max(len(chunk.rows) for chunk in chunks)
     sequence = collate_v2_sequences(chunks, max_len)
@@ -747,6 +1033,191 @@ def _teacher_chunk_cached(
             recurrent_stats["temporal_steps"] += len(slots)
     return _mean_tensor_dict(step_losses), states
 
+
+def _prepare_gpu_batch_cache(
+    model,
+    dataset,
+    config,
+    device,
+    strategy_manifest: StrategyManifest | None,
+):
+    if not bool(config.gpu_batch_cache):
+        return None, {
+            "enabled": False,
+            "cached_updates": 0,
+            "gpu_resident_updates": 0,
+            "cpu_resident_updates": 0,
+            "fallback_updates": 0,
+            "tensor_bytes": 0,
+            "gpu_tensor_bytes": 0,
+            "cpu_tensor_bytes": 0,
+            "build_seconds": 0.0,
+        }
+    started = time.perf_counter()
+    device = torch.device(device)
+    reserve_bytes = int(
+        float(config.gpu_batch_cache_reserve_gb) * (1024 ** 3)
+    )
+    groups = []
+    stats = {
+        "enabled": True,
+        "cached_updates": 0,
+        "gpu_resident_updates": 0,
+        "cpu_resident_updates": 0,
+        "fallback_updates": 0,
+        "tensor_bytes": 0,
+        "gpu_tensor_bytes": 0,
+        "cpu_tensor_bytes": 0,
+        "build_seconds": 0.0,
+    }
+
+    for episodes in _episode_groups(
+        dataset,
+        config.batch_sequences,
+        config.seed,
+        0,
+    ):
+        chunks_by_slot = [
+            _episode_chunks(ep, config.sequence_len)
+            for ep in episodes
+        ]
+        max_chunks = max(len(chunks) for chunks in chunks_by_slot)
+        updates = []
+        for chunk_index in range(max_chunks):
+            active = tuple(
+                (slot, chunks[chunk_index])
+                for slot, chunks in enumerate(chunks_by_slot)
+                if chunk_index < len(chunks)
+            )
+            chunks = [chunk for _, chunk in active]
+            lengths = [len(chunk.rows) for chunk in chunks]
+            cacheable = (
+                bool(lengths)
+                and len(set(lengths)) == 1
+                and lengths[0] <= int(getattr(model.core, "window", 0))
+            )
+            cached = None
+            if cacheable:
+                steps = int(lengths[0])
+                sequence = collate_v2_sequences(chunks, steps)
+                flat_rows = [
+                    row
+                    for chunk in chunks
+                    for row in chunk.rows
+                ]
+                targets = TensorActionTargets.from_actions(
+                    sequence.flat.canonical_actions,
+                    max_units=sequence.flat.own_units.shape[1],
+                )
+                ledger = TensorLedger.from_states(
+                    sequence.flat.structured_states,
+                    device="cpu",
+                )
+                strategy_slots = (
+                    _strategy_slots_for_rows(
+                        flat_rows,
+                        strategy_manifest,
+                        torch.device("cpu"),
+                    )
+                    if strategy_manifest is not None
+                    else None
+                )
+                flat = _strip_step_batch_python(sequence.flat)
+                tensor_bytes = (
+                    _tensor_bytes(flat)
+                    + _tensor_bytes(targets)
+                    + _tensor_bytes(ledger)
+                    + _tensor_bytes(strategy_slots)
+                )
+                resident_on_device = False
+
+                if device.type == "cuda" and torch.cuda.is_available():
+                    free_bytes, _ = torch.cuda.mem_get_info(device)
+                    if tensor_bytes <= max(0, int(free_bytes) - reserve_bytes):
+                        try:
+                            device_flat = _step_batch_to_device(flat, device)
+                            device_targets = _dataclass_to_device(
+                                targets, device,
+                            )
+                            device_ledger = _dataclass_to_device(
+                                ledger, device,
+                            )
+                            device_strategy_slots = strategy_slots
+                            if torch.is_tensor(strategy_slots):
+                                device_strategy_slots = strategy_slots.to(device)
+                            flat = device_flat
+                            targets = device_targets
+                            ledger = device_ledger
+                            strategy_slots = device_strategy_slots
+                            resident_on_device = True
+                        except torch.cuda.OutOfMemoryError:
+                            torch.cuda.empty_cache()
+                            resident_on_device = False
+
+                if (
+                    not resident_on_device
+                    and bool(config.gpu_batch_cache_pin_cpu)
+                    and device.type == "cuda"
+                    and torch.cuda.is_available()
+                ):
+                    try:
+                        flat = _pin_step_batch(flat)
+                        targets = _pin_tensor_dataclass(targets)
+                        ledger = _pin_tensor_dataclass(ledger)
+                        if (
+                            torch.is_tensor(strategy_slots)
+                            and strategy_slots.device.type == "cpu"
+                        ):
+                            strategy_slots = strategy_slots.pin_memory()
+                    except RuntimeError:
+                        pass
+
+                cached = _CachedTensorSequence(
+                    slots=tuple(slot for slot, _ in active),
+                    steps=steps,
+                    flat=flat,
+                    targets=targets,
+                    ledger=ledger,
+                    strategy_slots=strategy_slots,
+                    resident_on_device=resident_on_device,
+                    tensor_bytes=tensor_bytes,
+                )
+                stats["cached_updates"] += 1
+                stats["tensor_bytes"] += int(tensor_bytes)
+                if resident_on_device:
+                    stats["gpu_resident_updates"] += 1
+                    stats["gpu_tensor_bytes"] += int(tensor_bytes)
+                else:
+                    stats["cpu_resident_updates"] += 1
+                    stats["cpu_tensor_bytes"] += int(tensor_bytes)
+            else:
+                stats["fallback_updates"] += 1
+            updates.append(_PreparedTrainingUpdate(
+                active=active,
+                cached=cached,
+            ))
+        groups.append(_PreparedTrainingGroup(
+            slot_count=len(chunks_by_slot),
+            updates=tuple(updates),
+        ))
+
+    stats["build_seconds"] = float(time.perf_counter() - started)
+    payload = {
+        **stats,
+        "tensor_gb": float(stats["tensor_bytes"]) / (1024 ** 3),
+        "gpu_tensor_gb": float(stats["gpu_tensor_bytes"]) / (1024 ** 3),
+        "cpu_tensor_gb": float(stats["cpu_tensor_bytes"]) / (1024 ** 3),
+        "reserve_gb": float(config.gpu_batch_cache_reserve_gb),
+        "groups": len(groups),
+    }
+    print(
+        "FARMOS_GPU_BATCH_CACHE="
+        + json.dumps(payload, sort_keys=True),
+        flush=True,
+    )
+    return tuple(groups), stats
+
+
 def _recovery_chunks(rows, sequence_len):
     grouped = {}
     for row in rows:
@@ -838,6 +1309,7 @@ def _train_epoch(
     family_weights: dict[str, float] | None = None,
     market_active_op_weights: dict[str, float] | None = None,
     scaler=None,
+    prepared_training_groups=None,
 ):
     model.train()
     teacher_mix_probability = _teacher_mix_for_epoch(
@@ -854,16 +1326,26 @@ def _train_epoch(
     epoch_started = time.perf_counter()
     amp_device_type = getattr(device, "type", str(device).split(":")[0])
     amp_enabled = bool(config.use_amp and amp_device_type == "cuda")
-    prepared_groups = []
-    for episodes in _episode_groups(
-        dataset, config.batch_sequences, config.seed, epoch,
-    ):
-        prepared_groups.append([
-            _episode_chunks(ep, config.sequence_len) for ep in episodes
-        ])
-    epoch_expected_updates = sum(
-        max(len(chunks) for chunks in group) for group in prepared_groups
-    )
+    if prepared_training_groups is None:
+        prepared_groups = []
+        for episodes in _episode_groups(
+            dataset, config.batch_sequences, config.seed, epoch,
+        ):
+            prepared_groups.append([
+                _episode_chunks(ep, config.sequence_len) for ep in episodes
+            ])
+        epoch_expected_updates = sum(
+            max(len(chunks) for chunks in group)
+            for group in prepared_groups
+        )
+    else:
+        prepared_groups = list(prepared_training_groups)
+        random.Random(
+            int(config.seed) + 1000003 * int(epoch)
+        ).shuffle(prepared_groups)
+        epoch_expected_updates = sum(
+            len(group.updates) for group in prepared_groups
+        )
     if config.max_train_steps_per_epoch is not None:
         epoch_expected_updates = min(
             epoch_expected_updates, int(config.max_train_steps_per_epoch),
@@ -898,10 +1380,26 @@ def _train_epoch(
         recovery_losses.append(float(loss))
         return True
 
-    for chunks_by_slot in prepared_groups:
-        states = [None] * len(chunks_by_slot)
-        max_chunks = max(len(chunks) for chunks in chunks_by_slot)
+    def iter_group_updates(group):
+        if isinstance(group, _PreparedTrainingGroup):
+            for update in group.updates:
+                yield list(update.active), update.cached
+            return
+        max_chunks = max(len(chunks) for chunks in group)
         for chunk_index in range(max_chunks):
+            active = [
+                (slot, chunks[chunk_index])
+                for slot, chunks in enumerate(group)
+                if chunk_index < len(chunks)
+            ]
+            yield active, None
+
+    for group in prepared_groups:
+        if isinstance(group, _PreparedTrainingGroup):
+            states = [None] * int(group.slot_count)
+        else:
+            states = [None] * len(group)
+        for active, cached_update in iter_group_updates(group):
             if (
                 (config.max_train_steps is not None and train_steps >= config.max_train_steps)
                 or epoch_step_cap_reached()
@@ -913,10 +1411,9 @@ def _train_epoch(
                     or epoch_step_cap_reached()
                 ):
                     stop = True; break
-            active = [
-                (slot, chunks[chunk_index]) for slot, chunks in enumerate(chunks_by_slot)
-                if chunk_index < len(chunks)
-            ]
+            teacher_input = (
+                cached_update if cached_update is not None else active
+            )
             for slot, _ in active:
                 recurrent_stats["state_resets" if states[slot] is None else "state_carries"] += 1
             optimizer.zero_grad(set_to_none=True)
@@ -926,7 +1423,7 @@ def _train_epoch(
                 enabled=amp_enabled,
             ):
                 losses, states = _teacher_chunk_cached(
-                    model, active, states, device, recurrent_stats,
+                    model, teacher_input, states, device, recurrent_stats,
                     strategy_manifest=strategy_manifest,
                     family_weights=family_weights,
                     market_active_op_weights=market_active_op_weights,
@@ -1001,6 +1498,10 @@ def _train_epoch(
                     "tensor_sequence_chunks": int(
                         recurrent_stats.get("tensor_sequence_chunks", 0)
                     ),
+                    "cached_tensor_sequence_chunks": int(
+                        recurrent_stats.get("cached_tensor_sequence_chunks", 0)
+                    ),
+                    "gpu_batch_cache": bool(config.gpu_batch_cache),
                 }
                 if amp_device_type == "cuda" and torch.cuda.is_available():
                     progress["gpu_memory_mb"] = float(
@@ -1738,6 +2239,16 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
             read_recovery_rows(recovery_path), config.sequence_len,
         )
 
+    prepared_training_groups, gpu_batch_cache_stats = (
+        _prepare_gpu_batch_cache(
+            model,
+            train_data,
+            config,
+            device,
+            strategy_manifest,
+        )
+    )
+
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     best_path = output_dir / "bc_best.pt"
@@ -1767,6 +2278,24 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
         "recovery_temporal_steps": 0,
         "amp_overflow_skips": 0,
         "tensor_sequence_chunks": 0,
+        "cached_tensor_sequence_chunks": 0,
+        "gpu_batch_cache_enabled": bool(gpu_batch_cache_stats["enabled"]),
+        "gpu_batch_cache_updates": int(gpu_batch_cache_stats["cached_updates"]),
+        "gpu_batch_cache_gpu_updates": int(
+            gpu_batch_cache_stats["gpu_resident_updates"]
+        ),
+        "gpu_batch_cache_cpu_updates": int(
+            gpu_batch_cache_stats["cpu_resident_updates"]
+        ),
+        "gpu_batch_cache_fallback_updates": int(
+            gpu_batch_cache_stats["fallback_updates"]
+        ),
+        "gpu_batch_cache_gpu_bytes": int(
+            gpu_batch_cache_stats["gpu_tensor_bytes"]
+        ),
+        "gpu_batch_cache_cpu_bytes": int(
+            gpu_batch_cache_stats["cpu_tensor_bytes"]
+        ),
     }
     recovery_cursor = 0
     recovery_states = {}
@@ -1787,6 +2316,7 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
             family_weights=family_weights,
             market_active_op_weights=market_active_op_weights,
             scaler=scaler,
+            prepared_training_groups=prepared_training_groups,
         )
         if opening_rows:
             opening_metrics = _opening_strategy_replay(

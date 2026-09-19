@@ -436,6 +436,148 @@ def test_v32_gpu_tensor_chunk_matches_legacy_at_mix_endpoints(tmp_path, mix):
     )
 
 
+def test_v32_gpu_batch_cache_matches_uncached_tensor_path(tmp_path):
+    import numpy as np
+    from dataclasses import replace
+    from kaggrl.v2_training_data import V2EpisodeDataset
+    from kaggrl.v3_2_model import TemporalIntentPolicyV32
+    from kaggrl.v3_2_schema import ARCHITECTURE_VERSION as V32_ARCHITECTURE_VERSION
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.train_v3_bc import (
+        _prepare_gpu_batch_cache,
+        _teacher_chunk_cached,
+    )
+
+    dataset, stage0, stage1, _ = _fixture(tmp_path)
+    train = V2EpisodeDataset(dataset, "train", {"active_best"})
+    manifest = build_strategy_manifest([1])
+    config = replace(
+        _config(dataset, stage0, stage1, tmp_path / "cache-test"),
+        sequence_len=2,
+        batch_sequences=1,
+        model_architecture=V32_ARCHITECTURE_VERSION,
+        strategy_conditioning=True,
+        gpu_tensor_training=True,
+        gpu_batch_cache=True,
+    )
+
+    torch.manual_seed(775)
+    reference = TemporalIntentPolicyV32(strategy_count=1).eval()
+    cached_model = TemporalIntentPolicyV32(strategy_count=1).eval()
+    cached_model.load_state_dict(reference.state_dict())
+    groups, stats = _prepare_gpu_batch_cache(
+        cached_model,
+        train,
+        config,
+        torch.device("cpu"),
+        manifest,
+    )
+    assert groups
+    assert stats["cached_updates"] > 0
+    first = next(
+        update
+        for group in groups
+        for update in group.updates
+        if update.cached is not None
+    )
+    active = list(first.active)
+
+    reference_losses, reference_states = _teacher_chunk_cached(
+        reference,
+        active,
+        [None] * len(active),
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        teacher_mix_probability=0.5,
+        conditioning_rng=np.random.default_rng(19),
+        gpu_tensor_training=True,
+    )
+    cached_losses, cached_states = _teacher_chunk_cached(
+        cached_model,
+        first.cached,
+        [None] * len(active),
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        teacher_mix_probability=0.5,
+        conditioning_rng=np.random.default_rng(19),
+        gpu_tensor_training=True,
+    )
+    assert set(reference_losses) == set(cached_losses)
+    for key in reference_losses:
+        assert torch.allclose(
+            cached_losses[key], reference_losses[key], atol=1e-5, rtol=1e-5
+        ), key
+    for got, expected in zip(cached_states, reference_states):
+        assert torch.allclose(got.h, expected.h, atol=1e-5, rtol=1e-5)
+        assert torch.allclose(
+            got.memory, expected.memory, atol=1e-5, rtol=1e-5
+        )
+        assert torch.equal(got.valid_length, expected.valid_length)
+        assert torch.equal(got.write_pos, expected.write_pos)
+
+
+def test_v32_train_epoch_uses_prepared_gpu_batch_cache(tmp_path):
+    from dataclasses import replace
+    from kaggrl.v2_training_data import V2EpisodeDataset
+    from kaggrl.v3_2_model import TemporalIntentPolicyV32
+    from kaggrl.v3_2_schema import ARCHITECTURE_VERSION as V32_ARCHITECTURE_VERSION
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.train_v3_bc import (
+        _prepare_gpu_batch_cache,
+        _train_epoch,
+    )
+
+    dataset, stage0, stage1, _ = _fixture(tmp_path)
+    train = V2EpisodeDataset(dataset, "train", {"active_best"})
+    manifest = build_strategy_manifest([1])
+    config = replace(
+        _config(dataset, stage0, stage1, tmp_path / "cache-epoch"),
+        sequence_len=2,
+        batch_sequences=1,
+        max_train_steps=1,
+        model_architecture=V32_ARCHITECTURE_VERSION,
+        strategy_conditioning=True,
+        gpu_tensor_training=True,
+        gpu_batch_cache=True,
+    )
+    model = TemporalIntentPolicyV32(strategy_count=1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    groups, _ = _prepare_gpu_batch_cache(
+        model,
+        train,
+        config,
+        torch.device("cpu"),
+        manifest,
+    )
+    recurrent_stats = {
+        "temporal_steps": 0,
+        "state_resets": 0,
+        "state_carries": 0,
+        "expert_updates": 0,
+        "recovery_updates": 0,
+        "recovery_temporal_steps": 0,
+        "amp_overflow_skips": 0,
+        "tensor_sequence_chunks": 0,
+        "cached_tensor_sequence_chunks": 0,
+    }
+    metrics, train_steps, _, _ = _train_epoch(
+        model,
+        optimizer,
+        train,
+        config,
+        1,
+        0,
+        recurrent_stats,
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        prepared_training_groups=groups,
+    )
+    assert train_steps == 1
+    assert metrics["optimizer_steps_per_sec"] > 0.0
+    assert recurrent_stats["expert_updates"] == 1
+    assert recurrent_stats["cached_tensor_sequence_chunks"] == 1
+
+
 def test_v32_gpu_tensor_sequence_matches_legacy_multi_batch(tmp_path):
     import numpy as np
     from kaggrl.v2_training_data import V2EpisodeDataset
