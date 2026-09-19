@@ -7,8 +7,17 @@ from training.build_v3_recovery_dataset import (
     _RecoveryCollectingAgent,
     canonicalize_teacher_action,
     project_teacher_action_to_executable,
+    teacher_id_from_path,
     validate_recovery_row,
 )
+
+
+def test_teacher_id_from_extracted_directory():
+    from pathlib import Path
+
+    assert teacher_id_from_path(
+        Path("/content/source_public/extracted_v50/main.py")
+    ) == "v50"
 
 
 def _observation():

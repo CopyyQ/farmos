@@ -55,8 +55,9 @@ from kaggrl.v3_tensor_losses import (
 from kaggrl.v3_tensor_targets import TensorActionTargets
 from training.build_v3_recovery_dataset import (
     RecoveryCollectionEmptyError,
-    collect_v45_recovery,
+    collect_teacher_recovery,
     read_recovery_rows,
+    teacher_id_from_path,
     write_recovery_rows,
 )
 from training.train_v3_pretrain import (
@@ -2814,10 +2815,13 @@ def _collect_online_dagger_round(
         seed_start,
         seed_start + int(config.dagger_seeds_per_round),
     ))
+    teacher_id = teacher_id_from_path(teacher_path)
     dagger_dir = output_dir / "dagger"
     dagger_dir.mkdir(parents=True, exist_ok=True)
     policy_path = dagger_dir / f"epoch_{epoch:03d}_policy.npz"
-    round_path = dagger_dir / f"epoch_{epoch:03d}_v45.jsonl"
+    round_path = (
+        dagger_dir / f"epoch_{epoch:03d}_{teacher_id}.jsonl"
+    )
 
     export_v3_3_numpy(
         model,
@@ -2825,13 +2829,14 @@ def _collect_online_dagger_round(
         default_strategy_slot=slot,
     )
     try:
-        collect_v45_recovery(
+        collect_teacher_recovery(
             policy_path,
             teacher_path,
             round_path,
             seeds,
             episode_steps=int(config.dagger_episode_steps),
             strategy_slot=slot,
+            teacher_id=teacher_id,
         )
     except RecoveryCollectionEmptyError as error:
         metadata = {

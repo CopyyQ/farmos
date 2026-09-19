@@ -626,7 +626,7 @@ def test_v33_online_dagger_round_is_in_run_and_deterministic(
 
     def fake_collect(
         policy_path, teacher_path, output_path, seeds, *,
-        episode_steps, strategy_slot,
+        episode_steps, strategy_slot, teacher_id,
     ):
         captured["seeds"] = list(seeds)
         captured["episode_steps"] = int(episode_steps)
@@ -652,7 +652,7 @@ def test_v33_online_dagger_round_is_in_run_and_deterministic(
         return write_recovery_rows(rows, output_path)
 
     monkeypatch.setattr(train_module, "export_v3_3_numpy", fake_export)
-    monkeypatch.setattr(train_module, "collect_v45_recovery", fake_collect)
+    monkeypatch.setattr(train_module, "collect_teacher_recovery", fake_collect)
 
     rows, cumulative, metadata = train_module._collect_online_dagger_round(
         model,
@@ -723,7 +723,7 @@ def test_v33_online_dagger_empty_round_is_nonfatal(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(train_module, "export_v3_3_numpy", fake_export)
-    monkeypatch.setattr(train_module, "collect_v45_recovery", fake_collect)
+    monkeypatch.setattr(train_module, "collect_teacher_recovery", fake_collect)
 
     rows, cumulative, metadata = train_module._collect_online_dagger_round(
         model,

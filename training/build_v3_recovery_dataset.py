@@ -531,31 +531,51 @@ def _rollout_agent_class(model_path: Path):
         from rollout.v3_3_agent_numpy import V33NumpyRolloutAgent
         return V33NumpyRolloutAgent
     raise ValueError(
-        f"v45 DAgger requires V3.2/V3.3 NumPy policy, got format {format_version}"
+        "teacher DAgger requires V3.2/V3.3 NumPy policy, "
+        f"got format {format_version}"
     )
 
 
-def collect_v45_recovery(
+def teacher_id_from_path(path: Path) -> str:
+    parent = Path(path).resolve().parent.name.strip().lower()
+    for prefix in ("extracted_", "public_", "agent_"):
+        if parent.startswith(prefix):
+            parent = parent[len(prefix):]
+            break
+    cleaned = "".join(
+        char for char in parent
+        if char.isalnum() or char in {"-", "_"}
+    )
+    return cleaned or "teacher"
+
+
+def collect_teacher_recovery(
     model_path: Path,
-    v45_path: Path,
+    teacher_path: Path,
     output_path: Path,
     seeds: Iterable[int],
     *,
     episode_steps: int = 720,
     strategy_slot: int | None = None,
+    teacher_id: str | None = None,
 ) -> Path:
     from kaggle_environments import make
 
     model_path = Path(model_path)
-    v45_path = Path(v45_path)
+    teacher_path = Path(teacher_path)
     if not model_path.is_file():
         raise FileNotFoundError(model_path)
-    if not v45_path.is_file():
-        raise FileNotFoundError(v45_path)
+    if not teacher_path.is_file():
+        raise FileNotFoundError(teacher_path)
 
+    resolved_teacher_id = str(
+        teacher_id or teacher_id_from_path(teacher_path)
+    )
     model_sha = _sha256(model_path)
-    teacher_sha = _sha256(v45_path)
-    teacher_version = f"public_v45:sha256:{teacher_sha}"
+    teacher_sha = _sha256(teacher_path)
+    teacher_version = (
+        f"public_{resolved_teacher_id}:sha256:{teacher_sha}"
+    )
     agent_class = _rollout_agent_class(model_path)
     seed_list = [int(value) for value in seeds]
     rows: list[dict[str, Any]] = []
@@ -583,8 +603,8 @@ def collect_v45_recovery(
             )
             resolved_slot = getattr(candidate, "strategy_slot", strategy_slot)
             teacher = _load_submission_callable(
-                v45_path,
-                f"farmos_v45_teacher_{seed}_{seat}",
+                teacher_path,
+                f"farmos_{resolved_teacher_id}_teacher_{seed}_{seat}",
             )
             collector = _RecoveryCollectingAgent(
                 candidate,
@@ -593,18 +613,19 @@ def collect_v45_recovery(
                 int(seed) * 10 + seat,
                 teacher_version,
                 model_sha,
-                teacher_id="v45",
+                teacher_id=resolved_teacher_id,
                 supervision_kind="accepted_policy",
                 strategy_slot=resolved_slot,
-                # v45 is a route policy, not an oracle on arbitrary learner
-                # states. If its request must be projected to PASS/NOP/clip,
-                # using the projected action as a target teaches collapse.
+                # A submission teacher is not assumed to be an oracle on
+                # arbitrary learner states. If its request must be projected
+                # to PASS/NOP/clip, using that projected request as a target
+                # can teach closed-loop collapse.
                 drop_projected_labels=True,
             )
             agents = (
-                [collector, str(v45_path)]
+                [collector, str(teacher_path)]
                 if seat == 0
-                else [str(v45_path), collector]
+                else [str(teacher_path), collector]
             )
             env.run(agents)
             statuses = [str(value.status) for value in env.steps[-1]]
@@ -634,14 +655,14 @@ def collect_v45_recovery(
                 })
             if statuses != ["DONE", "DONE"]:
                 raise RuntimeError(
-                    f"v45 DAgger game did not finish: seed={seed} seat={seat} "
-                    f"statuses={statuses}"
+                    f"{resolved_teacher_id} DAgger game did not finish: "
+                    f"seed={seed} seat={seat} statuses={statuses}"
                 )
             rows.extend(collector.rows)
 
     error_report = {
-        "kind": "v3_v45_dagger_label_errors",
-        "teacher_id": "v45",
+        "kind": "v3_teacher_dagger_label_errors",
+        "teacher_id": resolved_teacher_id,
         "teacher_version": teacher_version,
         "teacher_sha256": teacher_sha,
         "learner_model_sha256": model_sha,
@@ -666,7 +687,7 @@ def collect_v45_recovery(
     if not rows:
         first = label_errors[0] if label_errors else {}
         raise RecoveryCollectionEmptyError(
-            "v45 DAgger produced zero accepted labels"
+            f"{resolved_teacher_id} DAgger produced zero accepted labels"
             + (
                 f"; first_error={first.get('stage')}:{first.get('error')}"
                 if first else ""
@@ -676,8 +697,8 @@ def collect_v45_recovery(
 
     output = write_recovery_rows(rows, output_path)
     metadata = {
-        "kind": "v3_v45_dagger_recovery",
-        "teacher_id": "v45",
+        "kind": "v3_teacher_dagger_recovery",
+        "teacher_id": resolved_teacher_id,
         "teacher_version": teacher_version,
         "teacher_sha256": teacher_sha,
         "supervision_kind": "accepted_policy",
@@ -705,6 +726,174 @@ def collect_v45_recovery(
         encoding="utf-8",
     )
     return output
+
+
+
+
+def collect_teacher_demonstrations(
+    teacher_path: Path,
+    output_path: Path,
+    seeds: Iterable[int],
+    *,
+    episode_steps: int = 720,
+    strategy_slot: int | None = None,
+    teacher_id: str | None = None,
+) -> Path:
+    """Collect clean on-policy demonstrations from teacher self-play.
+
+    Kaggle stores the action chosen from state t on env.steps[t + 1], so the
+    rows are aligned as (observation[t], action[t + 1]). Any teacher request
+    that still needs legality projection on its own trajectory is discarded.
+    """
+    from kaggle_environments import make
+
+    teacher_path = Path(teacher_path)
+    output_path = Path(output_path)
+    if not teacher_path.is_file():
+        raise FileNotFoundError(teacher_path)
+
+    resolved_teacher_id = str(
+        teacher_id or teacher_id_from_path(teacher_path)
+    )
+    teacher_sha = _sha256(teacher_path)
+    teacher_version = (
+        f"public_{resolved_teacher_id}:sha256:{teacher_sha}"
+    )
+    seed_list = [int(value) for value in seeds]
+    rows: list[dict[str, Any]] = []
+    projected_rows = 0
+    dropped_projected_rows = 0
+    projection_corrections = 0
+    game_summaries = []
+
+    for seed in seed_list:
+        env = make(
+            "kaggriculture",
+            configuration={
+                "seed": int(seed),
+                "episodeSteps": int(episode_steps),
+            },
+            debug=False,
+        )
+        env.run([str(teacher_path), str(teacher_path)])
+        statuses = [str(value.status) for value in env.steps[-1]]
+        if statuses != ["DONE", "DONE"]:
+            raise RuntimeError(
+                f"{resolved_teacher_id} self-play did not finish: "
+                f"seed={seed} statuses={statuses}"
+            )
+
+        per_game_rows = 0
+        per_game_dropped = 0
+        for seat in (0, 1):
+            previous_action: dict[str, Any] = {}
+            episode_id = int(seed) * 10 + int(seat)
+            for index in range(max(0, len(env.steps) - 1)):
+                state_agent = env.steps[index][seat]
+                action_agent = env.steps[index + 1][seat]
+                obs_plain = _plain(state_agent.observation)
+                raw_action = _plain(action_agent.action or {})
+                canonical = canonicalize_teacher_action(
+                    raw_action, obs_plain
+                )
+                structured_state = asdict(
+                    normalize_observation(obs_plain)
+                )
+                projected, corrections = (
+                    project_teacher_action_to_executable(
+                        canonical, structured_state
+                    )
+                )
+                projection_corrections += int(corrections)
+                projected_rows += int(corrections > 0)
+                if int(corrections) > 0:
+                    dropped_projected_rows += 1
+                    per_game_dropped += 1
+                    previous_action = projected
+                    continue
+
+                row = {
+                    "episode_id": episode_id,
+                    "seat": int(seat),
+                    "step": int(obs_plain.get("step", index)),
+                    "state": structured_state,
+                    "canonical_action": projected,
+                    "previous_action": deepcopy(previous_action),
+                    "previous_effect": {},
+                    "effects": {},
+                    "final_own_money": 0,
+                    "final_margin": 0,
+                    "terminal_result": 0,
+                    "teacher_id": resolved_teacher_id,
+                    "teacher_version": teacher_version,
+                    "supervision_kind": "accepted_policy",
+                }
+                if strategy_slot is not None:
+                    row["strategy_slot"] = int(strategy_slot)
+                validate_recovery_row(row)
+                rows.append(row)
+                per_game_rows += 1
+                previous_action = projected
+
+        game_summaries.append({
+            "seed": int(seed),
+            "accepted_rows": int(per_game_rows),
+            "dropped_projected_rows": int(per_game_dropped),
+        })
+
+    if not rows:
+        raise RecoveryCollectionEmptyError(
+            f"{resolved_teacher_id} self-play produced zero clean labels"
+        )
+
+    output = write_recovery_rows(rows, output_path)
+    metadata = {
+        "kind": "v3_teacher_selfplay_demonstrations",
+        "teacher_id": resolved_teacher_id,
+        "teacher_version": teacher_version,
+        "teacher_sha256": teacher_sha,
+        "supervision_kind": "accepted_policy",
+        "strategy_slot": (
+            None if strategy_slot is None else int(strategy_slot)
+        ),
+        "seeds": seed_list,
+        "episode_steps": int(episode_steps),
+        "games": len(seed_list),
+        "rows": len(rows),
+        "projected_rows": int(projected_rows),
+        "dropped_projected_rows": int(dropped_projected_rows),
+        "projection_corrections": int(projection_corrections),
+        "clean_label_rate": float(
+            len(rows) / max(len(rows) + dropped_projected_rows, 1)
+        ),
+        "game_summaries": game_summaries,
+    }
+    output.with_suffix(output.suffix + ".meta.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return output
+
+
+def collect_v45_recovery(
+    model_path: Path,
+    v45_path: Path,
+    output_path: Path,
+    seeds: Iterable[int],
+    *,
+    episode_steps: int = 720,
+    strategy_slot: int | None = None,
+) -> Path:
+    """Backward-compatible wrapper for existing v45 tooling/tests."""
+    return collect_teacher_recovery(
+        model_path,
+        v45_path,
+        output_path,
+        seeds,
+        episode_steps=episode_steps,
+        strategy_slot=strategy_slot,
+        teacher_id="v45",
+    )
 
 
 def build_expert_early_recovery(dataset_path: Path, output_path: Path,
