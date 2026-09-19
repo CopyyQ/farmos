@@ -1,0 +1,17 @@
+[project]
+name = "kaggrl"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0",
+  "pyarrow>=17",
+  "torch>=2.5",
+  "kaggle-environments==1.32.7",
+]
+
+[dependency-groups]
+dev = ["pytest>=9.1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

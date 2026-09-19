@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.bak_*
+.pytest_cache/
+.venv/
+runs/
+*.log
+kaggle.json
+assets/*.pt
+data/top_tier/live_v2/
+checkpoints/
