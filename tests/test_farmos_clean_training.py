@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from training.train_v3_bc import BCV3Config, _initial_state_collapse_report
+from scripts import prepare_data
 
 
 def _base():
@@ -27,6 +28,21 @@ def test_fast_validation_requires_last_epoch_selection():
         validation_profile="fast",
         selection_mode="last_epoch",
     ).validate()
+def test_prepare_data_accepts_repo_local_kaggle_json(tmp_path, monkeypatch):
+    repo_credential = tmp_path / "kaggle" / "kaggle.json"
+    repo_credential.parent.mkdir(parents=True)
+    repo_credential.write_text('{"username":"u","key":"k"}\n', encoding="utf-8")
+
+    monkeypatch.setattr(prepare_data, "REPO_KAGGLE_JSON", repo_credential)
+    monkeypatch.delenv("KAGGLE_USERNAME", raising=False)
+    monkeypatch.delenv("KAGGLE_KEY", raising=False)
+    monkeypatch.delenv("KAGGLE_CONFIG_DIR", raising=False)
+
+    selected = prepare_data._configure_kaggle_credentials()
+    assert Path(selected) == repo_credential.resolve()
+    assert Path(__import__("os").environ["KAGGLE_CONFIG_DIR"]) == repo_credential.parent.resolve()
+
+
 def test_initial_state_collapse_report_only_checks_opening_gate():
     config = replace(
         _base(),

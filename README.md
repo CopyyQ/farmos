@@ -20,14 +20,13 @@ Bản sạch để huấn luyện `TemporalIntentPolicyV32` trên Google Colab T
 !pip install -q -e . --no-deps
 ```
 
-Upload `kaggle.json` vào `/content/kaggle.json`, sau đó:
+Upload `kaggle.json` trực tiếp vào `/content/farmos/kaggle/kaggle.json`, sau đó:
 
 ```python
-!mkdir -p ~/.kaggle
-!cp /content/kaggle.json ~/.kaggle/kaggle.json
-!chmod 600 ~/.kaggle/kaggle.json
 !python scripts/prepare_data.py
 ```
+
+`prepare_data.py` tự đặt `KAGGLE_CONFIG_DIR=/content/farmos/kaggle`. File credential được `.gitignore` chặn và không được commit lên GitHub.
 ## Train seq32
 
 ```python

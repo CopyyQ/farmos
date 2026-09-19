@@ -18,6 +18,7 @@ REQUIRED = (
     ROOT / "checkpoints/rl_v2_stage1/STAGE1_ACCEPTED.json",
     ROOT / "assets/v32_smoke_init.pt",
 )
+REPO_KAGGLE_JSON = ROOT / "kaggle/kaggle.json"
 
 
 def _missing() -> list[Path]:
@@ -29,6 +30,45 @@ def _kaggle_command() -> list[str]:
     if executable:
         return [executable]
     return [sys.executable, "-m", "kaggle"]
+
+
+def _configure_kaggle_credentials() -> str:
+    if os.getenv("KAGGLE_USERNAME") and os.getenv("KAGGLE_KEY"):
+        print("FARMOS_KAGGLE_CREDENTIALS=environment", flush=True)
+        return "environment"
+
+    candidates: list[Path] = []
+    configured_dir = os.getenv("KAGGLE_CONFIG_DIR")
+    if configured_dir:
+        candidates.append(Path(configured_dir).expanduser() / "kaggle.json")
+    candidates.extend((
+        REPO_KAGGLE_JSON,
+        Path.home() / ".kaggle/kaggle.json",
+    ))
+
+    seen: set[Path] = set()
+    for credential in candidates:
+        credential = credential.expanduser().resolve()
+        if credential in seen:
+            continue
+        seen.add(credential)
+        if not credential.is_file():
+            continue
+        try:
+            credential.chmod(0o600)
+        except OSError:
+            pass
+        os.environ["KAGGLE_CONFIG_DIR"] = str(credential.parent)
+        print("FARMOS_KAGGLE_CREDENTIALS=" + str(credential), flush=True)
+        return str(credential)
+
+    raise RuntimeError(
+        "Kaggle credentials missing. Put kaggle.json at "
+        f"{REPO_KAGGLE_JSON} (Colab: /content/farmos/kaggle/kaggle.json), "
+        "or use ~/.kaggle/kaggle.json, or set KAGGLE_USERNAME/KAGGLE_KEY."
+    )
+
+
 def _download(dataset: str, target: Path) -> None:
     command = _kaggle_command() + [
         "datasets", "download", "-d", dataset,
@@ -64,13 +104,7 @@ def prepare(dataset: str) -> None:
     if not missing:
         print("FARMOS_DATA_READY=1", flush=True)
         return
-    if not (
-        Path.home().joinpath(".kaggle/kaggle.json").is_file()
-        or (os.getenv("KAGGLE_USERNAME") and os.getenv("KAGGLE_KEY"))
-    ):
-        raise RuntimeError(
-            "Kaggle credentials missing. Upload kaggle.json to ~/.kaggle/kaggle.json."
-        )
+    _configure_kaggle_credentials()
     with tempfile.TemporaryDirectory(prefix="farmos-data-") as temp:
         tempdir = Path(temp)
         _download(dataset, tempdir)
