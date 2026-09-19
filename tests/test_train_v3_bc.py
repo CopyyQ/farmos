@@ -153,6 +153,18 @@ def test_v3_bc_smoke_carries_full_temporal_state_and_writes_diagnostics(tmp_path
     assert (output / "manifest.sha256").is_file()
 
 
+
+def test_v3_bc_existing_output_fails_before_expensive_preflight(tmp_path):
+    dataset, stage0, stage1, _ = _fixture(tmp_path)
+    output = tmp_path / "already-exists"
+    output.mkdir()
+    (output / "history.jsonl").write_text("", encoding="utf-8")
+    config = _config(dataset, stage0, stage1, output)
+
+    with pytest.raises(FileExistsError, match="output exists"):
+        run_v3_bc(config, None)
+
+
 def test_v3_bc_reuses_domain_normalization_for_many_hands():
     one = action_loss(type("O", (), {"rows": (_output_row(1),)})(), (_target(1),))
     many = action_loss(type("O", (), {"rows": (_output_row(20),)})(), (_target(20),))

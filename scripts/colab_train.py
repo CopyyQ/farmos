@@ -45,6 +45,22 @@ def main() -> None:
     if not config_path.is_file():
         raise FileNotFoundError(config_path)
 
+    run_name = args.run_name or (
+        config_path.stem + "_" + time.strftime("%Y%m%d_%H%M%S")
+    )
+    output = ROOT / "runs" / run_name
+    blocking_outputs = (
+        output / "bc_best.pt",
+        output / "bc_last.pt",
+        output / "history.jsonl",
+        output / "strategy_manifest.json",
+    )
+    if any(path.exists() for path in blocking_outputs):
+        raise FileExistsError(
+            f"run already exists: {output}. "
+            "Choose a new --run-name; existing artifacts are preserved."
+        )
+
     dataset = ROOT / "data/top_tier/live_v2/transitions.parquet"
     stage0 = ROOT / "data/top_tier/live_v2/manifests/STAGE0_ACCEPTED.json"
     stage1 = ROOT / "checkpoints/rl_v2_stage1/STAGE1_ACCEPTED.json"
@@ -79,11 +95,6 @@ def main() -> None:
         )
         if not init_checkpoint.is_file():
             raise FileNotFoundError(init_checkpoint)
-    run_name = args.run_name or (
-        config_path.stem + "_" + time.strftime("%Y%m%d_%H%M%S")
-    )
-    output = ROOT / "runs" / run_name
-
     if args.recovery_dataset:
         values["recovery_dataset_path"] = str(
             Path(args.recovery_dataset).resolve()

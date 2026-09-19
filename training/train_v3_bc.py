@@ -2845,6 +2845,19 @@ def run_v3_bc(
     init_checkpoint: Path | None = None,
 ) -> Path:
     config.validate()
+    output_dir = Path(config.output_dir)
+    blocking_outputs = (
+        output_dir / "bc_best.pt",
+        output_dir / "bc_last.pt",
+        output_dir / "history.jsonl",
+        output_dir / "strategy_manifest.json",
+    )
+    if any(path.exists() for path in blocking_outputs):
+        raise FileExistsError(
+            f"v3 BC output exists: {output_dir}. "
+            "Choose a fresh output directory; existing artifacts are preserved."
+        )
+
     acceptance = verify_training_acceptance(
         config.stage0_marker, config.stage1_marker,
     )
