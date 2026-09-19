@@ -436,6 +436,141 @@ def test_v32_gpu_tensor_chunk_matches_legacy_at_mix_endpoints(tmp_path, mix):
     )
 
 
+def test_v32_gpu_tensor_sequence_matches_legacy_multi_batch(tmp_path):
+    import numpy as np
+    from kaggrl.v2_training_data import V2EpisodeDataset
+    from kaggrl.v3_2_model import TemporalIntentPolicyV32
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.train_v3_bc import _teacher_chunk_cached
+
+    dataset, _, _, _ = _fixture(tmp_path)
+    train = V2EpisodeDataset(dataset, "train", {"active_best"})
+    from kaggrl.v2_training_data import SequenceChunk
+
+    chunks = list(train.iter_chunks(4))
+    chunk = chunks[0]
+    second_rows = tuple(
+        {**dict(row), "episode_id": 3}
+        for row in chunk.rows
+    )
+    second = SequenceChunk(
+        episode_id=3,
+        seat=chunk.seat,
+        rows=second_rows,
+        episode_start=chunk.episode_start,
+        episode_end=chunk.episode_end,
+    )
+    active = [(0, chunk), (1, second)]
+    manifest = build_strategy_manifest([1])
+
+    torch.manual_seed(773)
+    legacy_model = TemporalIntentPolicyV32(strategy_count=1).eval()
+    tensor_model = TemporalIntentPolicyV32(strategy_count=1).eval()
+    tensor_model.load_state_dict(legacy_model.state_dict())
+
+    legacy, legacy_states = _teacher_chunk_cached(
+        legacy_model,
+        active,
+        [None, None],
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        teacher_mix_probability=1.0,
+        conditioning_rng=np.random.default_rng(7),
+        gpu_tensor_training=False,
+    )
+    stats = {"temporal_steps": 0}
+    tensor, tensor_states = _teacher_chunk_cached(
+        tensor_model,
+        active,
+        [None, None],
+        torch.device("cpu"),
+        recurrent_stats=stats,
+        strategy_manifest=manifest,
+        teacher_mix_probability=1.0,
+        conditioning_rng=np.random.default_rng(7),
+        gpu_tensor_training=True,
+    )
+    for key in legacy:
+        assert torch.allclose(
+            tensor[key], legacy[key], atol=1e-5, rtol=1e-5
+        ), key
+    for got, expected in zip(tensor_states, legacy_states):
+        assert torch.allclose(
+            got.h, expected.h, atol=1e-5, rtol=1e-5
+        )
+        assert torch.allclose(
+            got.memory, expected.memory, atol=1e-5, rtol=1e-5
+        )
+        assert torch.equal(got.valid_length, expected.valid_length)
+        assert torch.equal(got.write_pos, expected.write_pos)
+    assert stats["temporal_steps"] == 8
+    assert stats["tensor_sequence_chunks"] == 1
+
+
+def test_v32_gpu_tensor_sequence_matches_legacy_carried_state(tmp_path):
+    import numpy as np
+    from kaggrl.v2_training_data import V2EpisodeDataset
+    from kaggrl.v3_2_model import TemporalIntentPolicyV32
+    from kaggrl.v3_strategy import build_strategy_manifest
+    from training.train_v3_bc import _teacher_chunk_cached
+
+    dataset, _, _, _ = _fixture(tmp_path)
+    train = V2EpisodeDataset(dataset, "train", {"active_best"})
+    chunks = list(train.iter_chunks(2))
+    manifest = build_strategy_manifest([1])
+    torch.manual_seed(779)
+    legacy_model = TemporalIntentPolicyV32(strategy_count=1).eval()
+    tensor_model = TemporalIntentPolicyV32(strategy_count=1).eval()
+    tensor_model.load_state_dict(legacy_model.state_dict())
+
+    _, legacy_states = _teacher_chunk_cached(
+        legacy_model,
+        [(0, chunks[0])],
+        [None],
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        gpu_tensor_training=False,
+    )
+    _, tensor_states = _teacher_chunk_cached(
+        tensor_model,
+        [(0, chunks[0])],
+        [None],
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        gpu_tensor_training=True,
+    )
+    legacy, legacy_states = _teacher_chunk_cached(
+        legacy_model,
+        [(0, chunks[1])],
+        legacy_states,
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        gpu_tensor_training=False,
+    )
+    tensor, tensor_states = _teacher_chunk_cached(
+        tensor_model,
+        [(0, chunks[1])],
+        tensor_states,
+        torch.device("cpu"),
+        strategy_manifest=manifest,
+        gpu_tensor_training=True,
+    )
+    for key in legacy:
+        assert torch.allclose(
+            tensor[key], legacy[key], atol=1e-5, rtol=1e-5
+        ), key
+    assert torch.allclose(
+        tensor_states[0].memory,
+        legacy_states[0].memory,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.equal(
+        tensor_states[0].write_pos,
+        legacy_states[0].write_pos,
+    )
+
+
 def test_v32_gpu_tensor_chunk_backpropagates(tmp_path):
     import numpy as np
     from kaggrl.v2_training_data import V2EpisodeDataset

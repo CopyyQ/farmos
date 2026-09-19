@@ -408,3 +408,192 @@ def tensor_total_pretrain_loss(
         for name in DEFAULT_LOSS_WEIGHTS
     )
     return result
+
+
+def tensor_total_pretrain_loss_sequence(
+    outputs,
+    batch,
+    targets: TensorActionTargets,
+    *,
+    step: torch.Tensor,
+    batch_size: int,
+    steps: int,
+    weights: dict[str, float] | None = None,
+    family_weights=None,
+    market_active_op_weights=None,
+):
+    weights = dict(
+        DEFAULT_LOSS_WEIGHTS if weights is None else weights
+    )
+    if set(weights) != set(DEFAULT_LOSS_WEIGHTS):
+        raise ValueError(
+            "pretrain loss weights must define frozen objective components"
+        )
+    batch_size = int(batch_size)
+    steps = int(steps)
+    if targets.batch_size != batch_size * steps:
+        raise ValueError("sequence tensor target size mismatch")
+    device = outputs.unit_op_logits.device
+    targets = targets.to(device)
+    step = step.to(device=device, dtype=torch.long)
+    sample_weight = getattr(batch, "sample_weight", None)
+    if sample_weight is None:
+        sample_weight = torch.ones(
+            targets.batch_size,
+            device=device,
+            dtype=outputs.unit_op_logits.dtype,
+        )
+    else:
+        sample_weight = sample_weight.to(
+            device=device,
+            dtype=outputs.unit_op_logits.dtype,
+        )
+    sample_weight_bt = sample_weight.view(batch_size, steps)
+
+    unit_loss = _unit_semantic_loss(
+        outputs.unit_op_logits,
+        outputs.unit_item_logits,
+        outputs.unit_quantity_logits,
+        targets,
+        family_weights=family_weights,
+    ).view(batch_size, steps, targets.max_units)
+    unit_mask = targets.unit_mask.view(
+        batch_size, steps, targets.max_units
+    )
+    farmer_values = unit_loss[:, :, 0]
+    farmer_mask = unit_mask[:, :, 0]
+    farmer_num = (
+        farmer_values
+        * sample_weight_bt
+        * farmer_mask.to(farmer_values.dtype)
+    ).sum(dim=0)
+    farmer_den = (
+        sample_weight_bt
+        * farmer_mask.to(sample_weight_bt.dtype)
+    ).sum(dim=0).clamp_min(torch.finfo(farmer_values.dtype).eps)
+    farmer_t = farmer_num / farmer_den
+    farmer = farmer_t.mean()
+
+    if targets.max_units > 1:
+        hand_mask = unit_mask[:, :, 1:]
+        hand_count = hand_mask.sum(dim=-1)
+        hand_row = (
+            unit_loss[:, :, 1:]
+            * hand_mask.to(unit_loss.dtype)
+        ).sum(dim=-1) / hand_count.clamp_min(1).to(unit_loss.dtype)
+        hand_active = hand_count.gt(0)
+        hand_num = (
+            hand_row
+            * sample_weight_bt
+            * hand_active.to(hand_row.dtype)
+        ).sum(dim=0)
+        hand_den = (
+            sample_weight_bt
+            * hand_active.to(sample_weight_bt.dtype)
+        ).sum(dim=0).clamp_min(torch.finfo(hand_row.dtype).eps)
+        hands_t = hand_num / hand_den
+        hands = hands_t.mean()
+        hand_domain_active_t = hand_active.any(dim=0)
+    else:
+        hands_t = torch.zeros_like(farmer_t)
+        hands = farmer * 0.0
+        hand_domain_active_t = torch.zeros(
+            steps, device=device, dtype=torch.bool
+        )
+
+    market_decision = _market_semantic_loss(
+        outputs,
+        targets,
+        step=step,
+        family_weights=family_weights,
+        market_active_op_weights=market_active_op_weights,
+    )
+    market_slots = market_decision.shape[1]
+    market_decision = market_decision.view(
+        batch_size, steps, market_slots
+    )
+    market_mask = targets.market_mask.view(
+        batch_size, steps, market_slots
+    )
+    market_weight = sample_weight_bt.unsqueeze(-1)
+    market_num = (
+        market_decision
+        * market_weight
+        * market_mask.to(market_decision.dtype)
+    ).sum(dim=(0, 2))
+    market_den = (
+        market_weight
+        * market_mask.to(market_weight.dtype)
+    ).sum(dim=(0, 2)).clamp_min(
+        torch.finfo(market_decision.dtype).eps
+    )
+    market_t = market_num / market_den
+    market = market_t.mean()
+
+    domain_count_t = (
+        2.0 + hand_domain_active_t.to(farmer_t.dtype)
+    )
+    action_t = (
+        farmer_t
+        + market_t
+        + hands_t * hand_domain_active_t.to(hands_t.dtype)
+    ) / domain_count_t
+    action = action_t.mean()
+
+    aux_targets = getattr(batch, "auxiliary_targets", None)
+    if not isinstance(aux_targets, dict):
+        raise ValueError("batch.auxiliary_targets is required")
+
+    def mse(prediction, name):
+        target = aux_targets[name].to(
+            device=prediction.device,
+            dtype=prediction.dtype,
+        )
+        return F.mse_loss(prediction, target)
+
+    effect = mse(outputs.aux.effect, "effect")
+    future_resource = mse(
+        outputs.aux.future_resource, "future_resource"
+    )
+    opponent_effect = mse(
+        outputs.aux.opponent_effect, "opponent_effect"
+    )
+    terminal_money = mse(
+        outputs.aux.terminal_money, "terminal_money"
+    )
+    terminal_margin = mse(
+        outputs.aux.terminal_margin, "terminal_margin"
+    )
+    unit_target = aux_targets["unit_task"].to(
+        device=outputs.aux.unit_task.device,
+        dtype=outputs.aux.unit_task.dtype,
+    )
+    per_unit = (
+        outputs.aux.unit_task - unit_target
+    ).square().flatten(2).mean(dim=-1)
+    own_unit_mask = batch.own_unit_mask.to(
+        device=per_unit.device,
+        dtype=per_unit.dtype,
+    )
+    per_row = (
+        per_unit * own_unit_mask
+    ).sum(dim=1) / own_unit_mask.sum(dim=1).clamp_min(1.0)
+    unit_task = per_row.mean()
+    value = 0.5 * (terminal_money + terminal_margin)
+
+    result = {
+        "action": action,
+        "farmer": farmer,
+        "hands": hands,
+        "market": market,
+        "effect": effect,
+        "future_resource": future_resource,
+        "unit_task": unit_task,
+        "opponent_effect": opponent_effect,
+        "value": value,
+    }
+    result["total"] = sum(
+        float(weights[name]) * result[name]
+        for name in DEFAULT_LOSS_WEIGHTS
+    )
+    return result

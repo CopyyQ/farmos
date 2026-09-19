@@ -110,6 +110,125 @@ def test_ring_buffer_keeps_last_32_tokens_after_33_steps():
     assert torch.isfinite(ordered).all()
 
 
+def _sequence_reference(core, fused, previous, effect, economy, state=None):
+    outputs = []
+    intents = []
+    weights = []
+    entropy = []
+    mean_age = []
+    current = state
+    for time_index in range(fused.shape[1]):
+        out, intent, current, diagnostics = core.step(
+            fused[:, time_index],
+            previous[:, time_index],
+            effect[:, time_index],
+            economy[:, time_index],
+            current,
+        )
+        outputs.append(out)
+        intents.append(intent)
+        weights.append(diagnostics.attention_weights)
+        entropy.append(diagnostics.attention_entropy)
+        mean_age.append(diagnostics.mean_attended_age)
+    return (
+        torch.stack(outputs, dim=1),
+        torch.stack(intents, dim=1),
+        current,
+        torch.stack(weights, dim=1),
+        torch.stack(entropy, dim=1),
+        torch.stack(mean_age, dim=1),
+    )
+
+
+def test_temporal_sequence_matches_step_loop_from_zero_state():
+    from kaggrl.v2_tensorize import (
+        ECONOMY_FEATURES,
+        EFFECT_FEATURES,
+        PREV_ACTION_GLOBAL_FEATURES,
+    )
+
+    torch.manual_seed(29)
+    core = TemporalCore().eval()
+    batch, steps = 2, 5
+    fused = torch.randn(batch, steps, 256)
+    previous = torch.randn(batch, steps, len(PREV_ACTION_GLOBAL_FEATURES))
+    effect = torch.randn(batch, steps, len(EFFECT_FEATURES))
+    economy = torch.randn(batch, steps, len(ECONOMY_FEATURES))
+
+    reference = _sequence_reference(
+        core, fused, previous, effect, economy
+    )
+    output, intent, state, diagnostics = core.sequence(
+        fused, previous, effect, economy
+    )
+    assert torch.allclose(output, reference[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(intent, reference[1], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(state.h, reference[2].h, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(state.c, reference[2].c, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(state.memory, reference[2].memory, atol=1e-5, rtol=1e-5)
+    assert torch.equal(state.valid_length, reference[2].valid_length)
+    assert torch.equal(state.write_pos, reference[2].write_pos)
+    assert torch.allclose(
+        diagnostics.attention_weights, reference[3], atol=1e-5, rtol=1e-5
+    )
+    assert torch.allclose(
+        diagnostics.attention_entropy, reference[4], atol=1e-5, rtol=1e-5
+    )
+    assert torch.allclose(
+        diagnostics.mean_attended_age, reference[5], atol=1e-5, rtol=1e-5
+    )
+
+
+def test_temporal_sequence_matches_step_loop_with_carried_ring_state():
+    from kaggrl.v2_tensorize import (
+        ECONOMY_FEATURES,
+        EFFECT_FEATURES,
+        PREV_ACTION_GLOBAL_FEATURES,
+    )
+
+    torch.manual_seed(31)
+    core = TemporalCore().eval()
+    batch = 2
+    state = None
+    for _ in range(27):
+        fused0 = torch.randn(batch, 256)
+        previous0 = torch.randn(batch, len(PREV_ACTION_GLOBAL_FEATURES))
+        effect0 = torch.randn(batch, len(EFFECT_FEATURES))
+        economy0 = torch.randn(batch, len(ECONOMY_FEATURES))
+        _, _, state, _ = core.step(
+            fused0, previous0, effect0, economy0, state
+        )
+    carried = type(state)(
+        h=state.h.clone(),
+        c=state.c.clone(),
+        memory=state.memory.clone(),
+        valid_length=state.valid_length.clone(),
+        write_pos=state.write_pos.clone(),
+    )
+
+    steps = 5
+    fused = torch.randn(batch, steps, 256)
+    previous = torch.randn(batch, steps, len(PREV_ACTION_GLOBAL_FEATURES))
+    effect = torch.randn(batch, steps, len(EFFECT_FEATURES))
+    economy = torch.randn(batch, steps, len(ECONOMY_FEATURES))
+    reference = _sequence_reference(
+        core, fused, previous, effect, economy, carried
+    )
+    output, intent, final_state, diagnostics = core.sequence(
+        fused, previous, effect, economy, state
+    )
+    assert torch.allclose(output, reference[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(intent, reference[1], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(
+        final_state.memory, reference[2].memory, atol=1e-5, rtol=1e-5
+    )
+    assert torch.equal(final_state.valid_length, reference[2].valid_length)
+    assert torch.equal(final_state.write_pos, reference[2].write_pos)
+    assert torch.allclose(
+        diagnostics.attention_weights, reference[3], atol=1e-5, rtol=1e-5
+    )
+
+
 def test_attention_fp16_masking_and_diagnostics_are_finite():
     torch.manual_seed(17)
     core = TemporalCore(window=4).eval().half()

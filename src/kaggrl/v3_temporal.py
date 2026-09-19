@@ -190,6 +190,167 @@ class TemporalCore(nn.Module):
         )
         return context, diagnostics
 
+    def sequence(
+        self,
+        fused: torch.Tensor,
+        previous_action_global: torch.Tensor,
+        previous_effect: torch.Tensor,
+        economy: torch.Tensor,
+        state: TemporalState | None = None,
+    ):
+        if fused.ndim != 3 or fused.shape[-1] != 256:
+            raise ValueError("temporal sequence fused input must be [B,T,256]")
+        batch, steps, _ = fused.shape
+        if steps <= 0:
+            raise ValueError("temporal sequence must contain at least one step")
+        if steps > self.window:
+            raise ValueError("temporal fast sequence currently requires T <= window")
+        if state is None:
+            state = self.zero_state(batch, fused.device, fused.dtype)
+        if state.h.shape[0] != batch:
+            raise ValueError("temporal sequence state batch mismatch")
+
+        h0 = state.h.unsqueeze(0)
+        c0 = state.c.unsqueeze(0)
+        h_seq, hn, cn = torch.ops.aten.lstm.input(
+            fused,
+            [h0, c0],
+            [
+                self.lstm.weight_ih,
+                self.lstm.weight_hh,
+                self.lstm.bias_ih,
+                self.lstm.bias_hh,
+            ],
+            True,
+            1,
+            0.0,
+            self.training,
+            False,
+            True,
+        )
+        token_input = torch.cat([
+            h_seq,
+            previous_action_global,
+            previous_effect,
+            economy,
+        ], dim=-1)
+        token = self.token_norm(self.token_proj(token_input))
+
+        ordered, _ = self._ordered_with_mask(state)
+        positions = torch.arange(
+            self.window, device=fused.device, dtype=torch.long
+        )
+        times = torch.arange(
+            steps, device=fused.device, dtype=torch.long
+        )
+        valid_length = torch.clamp(
+            state.valid_length.unsqueeze(1)
+            + times.unsqueeze(0)
+            + 1,
+            max=self.window,
+        )
+        source_start = (
+            state.valid_length.unsqueeze(1)
+            + times.unsqueeze(0)
+            + 1
+            - valid_length
+        )
+        source = source_start.unsqueeze(-1) + positions.view(1, 1, -1)
+        valid = positions.view(1, 1, -1) < valid_length.unsqueeze(-1)
+        incoming_length = state.valid_length.view(batch, 1, 1)
+        combined_index = torch.where(
+            source >= incoming_length,
+            self.window + (source - incoming_length),
+            source,
+        ).clamp(0, self.window + steps - 1)
+        combined = torch.cat([ordered, token], dim=1)
+        batch_index = torch.arange(
+            batch, device=fused.device
+        ).view(batch, 1, 1)
+        memory = combined[batch_index, combined_index]
+        memory = memory * valid.unsqueeze(-1).to(memory.dtype)
+
+        ages = (
+            valid_length.unsqueeze(-1)
+            - 1
+            - positions.view(1, 1, -1)
+        ).clamp(min=0, max=self.window - 1)
+        age = self.relative_age.to(memory)[ages]
+        kv_input = (memory + age) * valid.unsqueeze(-1).to(memory.dtype)
+
+        head_dim = self.attention_dim // self.heads
+        q = self.q_proj(token).view(
+            batch, steps, self.heads, head_dim
+        )
+        k = self.k_proj(kv_input).view(
+            batch, steps, self.window, self.heads, head_dim
+        ).permute(0, 1, 3, 2, 4)
+        v = self.v_proj(kv_input).view(
+            batch, steps, self.window, self.heads, head_dim
+        ).permute(0, 1, 3, 2, 4)
+        scores = torch.einsum(
+            "bthd,bthwd->bthw", q, k
+        ) / math.sqrt(float(head_dim))
+        scores = scores.masked_fill(
+            ~valid.unsqueeze(2),
+            torch.finfo(scores.dtype).min,
+        )
+        weights = torch.softmax(scores.float(), dim=-1)
+        context = torch.einsum(
+            "bthw,bthwd->bthd",
+            weights.to(v.dtype),
+            v,
+        ).reshape(batch, steps, self.attention_dim)
+        context = self.o_proj(context)
+        entropy = -(
+            weights
+            * weights.clamp_min(
+                torch.finfo(weights.dtype).tiny
+            ).log()
+        ).sum(dim=-1)
+        mean_age = (
+            weights
+            * ages.unsqueeze(2).to(weights.dtype)
+        ).sum(dim=-1)
+
+        attention_hidden = self.attention_to_hidden(context)
+        gate = torch.sigmoid(
+            self.fusion_gate(
+                torch.cat([h_seq, attention_hidden], dim=-1)
+            )
+        )
+        fused_temporal = self.fusion_norm(
+            h_seq + gate * attention_hidden
+        )
+        intent = self.intent(fused_temporal)
+
+        write_index = (
+            state.write_pos.unsqueeze(1)
+            + times.unsqueeze(0)
+        ) % self.window
+        scatter_index = write_index.unsqueeze(-1).expand(
+            batch, steps, self.attention_dim
+        )
+        next_memory = state.memory.scatter(
+            1, scatter_index, token
+        )
+        next_state = TemporalState(
+            h=hn[0],
+            c=cn[0],
+            memory=next_memory,
+            valid_length=torch.clamp(
+                state.valid_length + steps,
+                max=self.window,
+            ),
+            write_pos=(state.write_pos + steps) % self.window,
+        )
+        diagnostics = TemporalDiagnostics(
+            attention_weights=weights,
+            attention_entropy=entropy,
+            mean_attended_age=mean_age,
+        )
+        return fused_temporal, intent, next_state, diagnostics
+
     def step(
         self,
         fused: torch.Tensor,

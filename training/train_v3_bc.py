@@ -42,7 +42,10 @@ from kaggrl.v3_strategy import (
 )
 from kaggrl.v3_tensor_decoder import teacher_step_tensor_mixed
 from kaggrl.v3_tensor_ledger import TensorLedger
-from kaggrl.v3_tensor_losses import tensor_total_pretrain_loss
+from kaggrl.v3_tensor_losses import (
+    tensor_total_pretrain_loss,
+    tensor_total_pretrain_loss_sequence,
+)
 from kaggrl.v3_tensor_targets import TensorActionTargets
 from training.build_v3_recovery_dataset import read_recovery_rows
 from training.train_v3_pretrain import (
@@ -510,6 +513,129 @@ def _slice_step_batch(flat, row_indices):
         result.sample_weight = sample_weight.index_select(0, index)
     return result
 
+
+def _teacher_chunk_tensor_sequence(
+    model,
+    active_chunks,
+    states,
+    device,
+    sequence,
+    tensor_targets,
+    tensor_ledger,
+    tensor_generator,
+    *,
+    strategy_manifest=None,
+    family_weights=None,
+    market_active_op_weights=None,
+    teacher_mix_probability=1.0,
+    recurrent_stats=None,
+):
+    chunks = [chunk for _, chunk in active_chunks]
+    lengths = [len(chunk.rows) for chunk in chunks]
+    if not lengths or len(set(lengths)) != 1:
+        raise ValueError("tensor sequence path requires equal chunk lengths")
+    batch_size = len(chunks)
+    steps = lengths[0]
+    if steps <= 0 or steps > int(model.core.window):
+        raise ValueError("tensor sequence path requires 1 <= T <= attention window")
+    if int(sequence.flat.own_grid.shape[0]) != batch_size * steps:
+        raise RuntimeError("flat sequence row order/size mismatch")
+
+    slots = [slot for slot, _ in active_chunks]
+    packed = _pack_states(states, slots)
+    flat_rows = [
+        row
+        for chunk in chunks
+        for row in chunk.rows
+    ]
+    flat_strategy_slots = (
+        _strategy_slots_for_rows(
+            flat_rows,
+            strategy_manifest,
+            device,
+        )
+        if strategy_manifest is not None
+        else None
+    )
+
+    encoded = model.encoder(sequence.flat)
+    strategy_context = None
+    core_input = encoded.fused
+    if flat_strategy_slots is not None:
+        if getattr(model, "strategy_embedding", None) is None:
+            raise RuntimeError("strategy-conditioned fast path needs an embedding")
+        strategy_context = model.strategy_embedding(
+            flat_strategy_slots
+        ).to(encoded.fused)
+        core_context = torch.cat(
+            [strategy_context, strategy_context],
+            dim=-1,
+        )
+        if core_context.shape != encoded.fused.shape:
+            raise RuntimeError("strategy core context shape mismatch")
+        core_input = (
+            encoded.fused
+            + float(STRATEGY_CORE_SCALE) * core_context
+        )
+
+    def bt(value):
+        return value.reshape(
+            batch_size,
+            steps,
+            *value.shape[1:],
+        )
+
+    fused_seq, base_intent_seq, next_state, diagnostics = model.core.sequence(
+        bt(core_input),
+        bt(sequence.flat.previous_action_global),
+        bt(sequence.flat.previous_effect),
+        bt(sequence.flat.economy),
+        packed,
+    )
+    fused_flat = fused_seq.reshape(batch_size * steps, -1)
+    base_intent_flat = base_intent_seq.reshape(batch_size * steps, -1)
+    intent_flat = (
+        base_intent_flat
+        if strategy_context is None
+        else base_intent_flat + strategy_context
+    )
+    output = teacher_step_tensor_mixed(
+        model,
+        sequence.flat,
+        tensor_targets,
+        tensor_ledger,
+        packed,
+        strategy_slots=flat_strategy_slots,
+        teacher_mix_probability=teacher_mix_probability,
+        generator=tensor_generator,
+        precomputed={
+            "encoded": encoded,
+            "fused_temporal": fused_flat,
+            "intent": intent_flat,
+            "temporal_state": next_state,
+            "temporal_diagnostics": diagnostics,
+            "strategy_context": strategy_context,
+        },
+    )
+    losses = tensor_total_pretrain_loss_sequence(
+        output,
+        sequence.flat,
+        tensor_targets,
+        step=tensor_ledger.step,
+        batch_size=batch_size,
+        steps=steps,
+        family_weights=family_weights,
+        market_active_op_weights=market_active_op_weights,
+    )
+    _store_state(states, slots, next_state)
+    if recurrent_stats is not None:
+        recurrent_stats["temporal_steps"] += batch_size * steps
+        recurrent_stats["tensor_sequence_chunks"] = (
+            int(recurrent_stats.get("tensor_sequence_chunks", 0)) + 1
+        )
+    return losses, states
+
+
 def _teacher_chunk_cached(
     model, active_chunks, states, device, recurrent_stats=None,
     strategy_manifest: StrategyManifest | None = None,
@@ -543,6 +669,27 @@ def _teacher_chunk_cached(
         tensor_generator = torch.Generator(device=generator_device)
         tensor_generator.manual_seed(seed)
     move_step_batch(sequence.flat, device)
+    equal_lengths = len({len(chunk.rows) for chunk in chunks}) == 1
+    if (
+        gpu_tensor_training
+        and equal_lengths
+        and max_len <= int(getattr(model.core, "window", 0))
+    ):
+        return _teacher_chunk_tensor_sequence(
+            model,
+            active_chunks,
+            states,
+            device,
+            sequence,
+            tensor_targets,
+            tensor_ledger,
+            tensor_generator,
+            strategy_manifest=strategy_manifest,
+            family_weights=family_weights,
+            market_active_op_weights=market_active_op_weights,
+            teacher_mix_probability=teacher_mix_probability,
+            recurrent_stats=recurrent_stats,
+        )
     step_losses = []
     for time_index in range(max_len):
         active_positions = [
@@ -851,6 +998,9 @@ def _train_epoch(
                     ),
                     "amp_overflow_skips": int(recurrent_stats["amp_overflow_skips"]),
                     "gpu_tensor_training": bool(config.gpu_tensor_training),
+                    "tensor_sequence_chunks": int(
+                        recurrent_stats.get("tensor_sequence_chunks", 0)
+                    ),
                 }
                 if amp_device_type == "cuda" and torch.cuda.is_available():
                     progress["gpu_memory_mb"] = float(
@@ -1616,6 +1766,7 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
         "recovery_updates": 0,
         "recovery_temporal_steps": 0,
         "amp_overflow_skips": 0,
+        "tensor_sequence_chunks": 0,
     }
     recovery_cursor = 0
     recovery_states = {}

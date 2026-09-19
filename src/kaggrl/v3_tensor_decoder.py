@@ -478,8 +478,9 @@ def teacher_step_tensor_mixed(
     strategy_slots: torch.Tensor | None = None,
     teacher_mix_probability: float = 1.0,
     generator: torch.Generator | None = None,
+    precomputed: dict | None = None,
 ) -> TensorTeacherPolicyOutput:
-    if float(teacher_mix_probability) >= 1.0:
+    if float(teacher_mix_probability) >= 1.0 and precomputed is None:
         return teacher_step_tensor(
             model,
             batch,
@@ -495,27 +496,40 @@ def teacher_step_tensor_mixed(
     if targets.max_units != int(batch.own_unit_mask.shape[1]):
         raise ValueError("tensor target unit width mismatch")
 
-    encoded = model.encoder(batch)
-    core_input = model._condition_core_input(
-        encoded.fused, strategy_slots,
-    )
-    fused_temporal, intent, next_state, diagnostics = model.core.step(
-        core_input,
-        batch.previous_action_global,
-        batch.previous_effect,
-        batch.economy,
-        state,
-    )
-    strategy_context = model._strategy_embedding_for(
-        intent, strategy_slots,
-    )
-    if strategy_context is not None:
-        intent = intent + strategy_context
+    if precomputed is None:
+        encoded = model.encoder(batch)
+        core_input = model._condition_core_input(
+            encoded.fused, strategy_slots,
+        )
+        fused_temporal, intent, next_state, diagnostics = model.core.step(
+            core_input,
+            batch.previous_action_global,
+            batch.previous_effect,
+            batch.economy,
+            state,
+        )
+        strategy_context = model._strategy_embedding_for(
+            intent, strategy_slots,
+        )
+        if strategy_context is not None:
+            intent = intent + strategy_context
+    else:
+        encoded = precomputed["encoded"]
+        fused_temporal = precomputed["fused_temporal"]
+        intent = precomputed["intent"]
+        next_state = precomputed["temporal_state"]
+        diagnostics = precomputed["temporal_diagnostics"]
+        strategy_context = precomputed.get("strategy_context")
 
     device = fused_temporal.device
     target_device = targets.to(device)
     expert_ledger = initial_ledger.to(device).clone()
-    conditioning_ledger = initial_ledger.to(device).clone()
+    shared_conditioning_ledger = float(teacher_mix_probability) >= 1.0
+    conditioning_ledger = (
+        expert_ledger
+        if shared_conditioning_ledger
+        else initial_ledger.to(device).clone()
+    )
     expert_ledger.set_atomic_plant_blocked(
         target_device.atomic_plant_blocked(expert_ledger.seeds)
     )
@@ -670,13 +684,14 @@ def teacher_step_tensor_mixed(
             target_device.unit_quantity[:, actor_index],
             active=active,
         )
-        conditioning_ledger.apply_unit(
-            actor_index,
-            conditioning_op,
-            conditioning_item,
-            conditioning_quantity,
-            active=active,
-        )
+        if not shared_conditioning_ledger:
+            conditioning_ledger.apply_unit(
+                actor_index,
+                conditioning_op,
+                conditioning_item,
+                conditioning_quantity,
+                active=active,
+            )
 
     market_continue_logits = []
     market_active_logits = []
@@ -856,13 +871,14 @@ def teacher_step_tensor_mixed(
             known_executed=target_device.market_executed[:, slot],
             active=active,
         )
-        conditioning_ledger.apply_market(
-            conditioning_op,
-            conditioning_item,
-            conditioning_quantity,
-            known_executed=torch.zeros_like(active),
-            active=active,
-        )
+        if not shared_conditioning_ledger:
+            conditioning_ledger.apply_market(
+                conditioning_op,
+                conditioning_item,
+                conditioning_quantity,
+                known_executed=torch.zeros_like(active),
+                active=active,
+            )
 
     return TensorTeacherPolicyOutput(
         unit_op_logits=torch.stack(unit_op_logits, dim=1),
