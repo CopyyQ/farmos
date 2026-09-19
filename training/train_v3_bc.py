@@ -112,6 +112,8 @@ class BCV3Config:
     model_architecture: str = ARCHITECTURE_VERSION
     progress_every: int = 0
     use_amp: bool = False
+    amp_init_scale: float = 1024.0
+    amp_growth_interval: int = 2000
     validation_profile: str = "full"
     selection_mode: str = "offline_legacy"
     clear_cuda_cache: bool = True
@@ -130,6 +132,10 @@ class BCV3Config:
             raise ValueError("max_train_steps_per_epoch must be positive when set")
         if int(self.progress_every) < 0:
             raise ValueError("progress_every must be non-negative")
+        if float(self.amp_init_scale) <= 0.0:
+            raise ValueError("amp_init_scale must be positive")
+        if int(self.amp_growth_interval) <= 0:
+            raise ValueError("amp_growth_interval must be positive")
         if self.validation_profile not in {"full", "fast"}:
             raise ValueError("validation_profile must be 'full' or 'fast'")
         if self.selection_mode not in {"offline_legacy", "last_epoch"}:
@@ -600,6 +606,30 @@ def _recovery_update(
     return float(total.detach().cpu().item()), model.core.detach_state(state)
 
 
+def _finish_optimizer_step(
+    model, optimizer, config, *, amp_enabled: bool, scaler=None,
+):
+    norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), config.gradient_clip,
+    )
+    norm_tensor = torch.as_tensor(norm)
+    finite = bool(torch.isfinite(norm_tensor).item())
+    if amp_enabled:
+        if scaler is None:
+            raise RuntimeError("AMP training requires a GradScaler")
+        scale_before = float(scaler.get_scale())
+        # GradScaler.step() inspects the overflow state captured by unscale_().
+        # When overflow is present it intentionally skips optimizer.step().
+        scaler.step(optimizer)
+        scaler.update()
+        scale_after = float(scaler.get_scale())
+        return float(norm_tensor.detach().cpu()), finite, scale_before, scale_after
+    if not finite:
+        raise RuntimeError("non-finite v3 BC gradient norm")
+    optimizer.step()
+    return float(norm_tensor.detach().cpu()), True, None, None
+
+
 def _train_epoch(
     model, optimizer, dataset, config, epoch,
     train_steps, recurrent_stats, device, recovery_chunks=None,
@@ -712,15 +742,28 @@ def _train_epoch(
                 scaler.unscale_(optimizer)
             else:
                 losses["total"].backward()
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
-            if not torch.isfinite(torch.as_tensor(norm)):
-                raise RuntimeError("non-finite v3 BC gradient norm")
-            if amp_enabled:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
+            norm, gradient_finite, scale_before, scale_after = _finish_optimizer_step(
+                model,
+                optimizer,
+                config,
+                amp_enabled=amp_enabled,
+                scaler=scaler,
+            )
             states = _detach_states(model, states)
+            if amp_enabled and not gradient_finite:
+                recurrent_stats["amp_overflow_skips"] += 1
+                optimizer.zero_grad(set_to_none=True)
+                print(
+                    "V3_BC_AMP_OVERFLOW=" + json.dumps({
+                        "epoch": int(epoch),
+                        "gradient_norm": float(norm),
+                        "scale_before": float(scale_before),
+                        "scale_after": float(scale_after),
+                        "overflow_skips": int(recurrent_stats["amp_overflow_skips"]),
+                    }, sort_keys=True),
+                    flush=True,
+                )
+                continue
             metric_row = _float_dict(losses)
             metrics.append(metric_row)
             recurrent_stats["expert_updates"] += 1
@@ -748,6 +791,11 @@ def _train_epoch(
                     "eta_seconds": float(eta),
                     "loss_total": float(metric_row["total"]),
                     "amp": bool(amp_enabled),
+                    "amp_scale": (
+                        float(scaler.get_scale()) if amp_enabled and scaler is not None
+                        else None
+                    ),
+                    "amp_overflow_skips": int(recurrent_stats["amp_overflow_skips"]),
                 }
                 if amp_device_type == "cuda" and torch.cuda.is_available():
                     progress["gpu_memory_mb"] = float(
@@ -1461,7 +1509,12 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
         config.use_amp
         and getattr(device, "type", str(device).split(":")[0]) == "cuda"
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=amp_enabled,
+        init_scale=float(config.amp_init_scale),
+        growth_interval=int(config.amp_growth_interval),
+    )
     opening_rows = (
         _opening_training_rows(train_data)
         if (
@@ -1507,6 +1560,7 @@ def run_v3_bc(config: BCV3Config, init_checkpoint: Path) -> Path:
         "expert_updates": 0,
         "recovery_updates": 0,
         "recovery_temporal_steps": 0,
+        "amp_overflow_skips": 0,
     }
     recovery_cursor = 0
     recovery_states = {}

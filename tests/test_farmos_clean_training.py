@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from training.train_v3_bc import BCV3Config, _initial_state_collapse_report
+from training.train_v3_bc import (
+    BCV3Config,
+    _finish_optimizer_step,
+    _initial_state_collapse_report,
+)
 from scripts import prepare_data
 
 
@@ -41,6 +45,58 @@ def test_prepare_data_accepts_repo_local_kaggle_json(tmp_path, monkeypatch):
     selected = prepare_data._configure_kaggle_credentials()
     assert Path(selected) == repo_credential.resolve()
     assert Path(__import__("os").environ["KAGGLE_CONFIG_DIR"]) == repo_credential.parent.resolve()
+
+
+def test_amp_gradient_overflow_is_nonfatal_and_updates_scaler():
+    import torch
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    next(model.parameters()).grad = torch.tensor([[float("inf")]])
+
+    class FakeScaler:
+        def __init__(self):
+            self.scale = 1024.0
+            self.step_calls = 0
+
+        def get_scale(self):
+            return self.scale
+
+        def step(self, optimizer):
+            self.step_calls += 1
+
+        def update(self):
+            self.scale /= 2.0
+
+    scaler = FakeScaler()
+    norm, finite, before, after = _finish_optimizer_step(
+        model,
+        optimizer,
+        _base(),
+        amp_enabled=True,
+        scaler=scaler,
+    )
+    assert norm == float("inf")
+    assert finite is False
+    assert before == 1024.0
+    assert after == 512.0
+    assert scaler.step_calls == 1
+
+
+def test_non_amp_gradient_overflow_remains_fatal():
+    import torch
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    next(model.parameters()).grad = torch.tensor([[float("inf")]])
+    with pytest.raises(RuntimeError, match="non-finite v3 BC gradient norm"):
+        _finish_optimizer_step(
+            model,
+            optimizer,
+            _base(),
+            amp_enabled=False,
+            scaler=None,
+        )
 
 
 def test_initial_state_collapse_report_only_checks_opening_gate():
