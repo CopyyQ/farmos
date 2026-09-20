@@ -1,6 +1,12 @@
 from __future__ import annotations
 import math
 import numpy as np
+from .clock import (
+    CLOCK_FEATURES,
+    LEGACY_CLOCK_FEATURES,
+    V4_CLOCK_EXTRA_FEATURES,
+    resolve_clock,
+)
 from .constants import CROPS, ANIMALS, PRODUCTS
 
 SHOPS = (
@@ -13,9 +19,18 @@ QUADRANTS = ("NW", "NE", "SW", "SE")
 
 class ObservationEncoder:
     """Canonical macro-first semantic encoder for Kaggriculture observations."""
-    def __init__(self, size: int = 1024, max_hands: int = 16):
+    def __init__(
+        self,
+        size: int = 1024,
+        max_hands: int = 16,
+        *,
+        clock_schema: str = "legacy",
+    ):
+        if clock_schema not in {"legacy", "v4"}:
+            raise ValueError("clock_schema must be 'legacy' or 'v4'")
         self.size = int(size)
         self.max_hands = int(max_hands)
+        self.clock_schema = clock_schema
 
     @staticmethod
     def _get(obj, key, default=None):
@@ -160,19 +175,21 @@ class ObservationEncoder:
             return None
         return row[x]
 
-    def encode(self, observation):
+    def encode(self, observation, configuration=None):
         player = int(self._get(observation, "player", 0) or 0)
         farms = list(self._get(observation, "farms", []) or [])
         if not farms:
             return np.zeros(self.size, dtype=np.float32)
         player = max(0, min(player, len(farms) - 1))
-        day = int(self._get(observation, "day", 0) or 0)
-        hour = int(self._get(observation, "hour", 0) or 0)
-        step = int(self._get(observation, "step", day * 24 + hour) or 0)
+        clock = resolve_clock(observation, configuration)
+        day, hour = clock.day, clock.hour
         board_size = len(self._get(farms[player], "tiles", []) or []) or 10
-        out = [self._clip(step / 719.0), self._clip(day / 29.0), self._clip(hour / 23.0)]
-        phase = 2.0 * math.pi * (hour % 24) / 24.0
-        out.extend((math.sin(phase), math.cos(phase)))
+        clock_values = dict(zip(CLOCK_FEATURES, clock.features()))
+        if len(clock_values) != len(CLOCK_FEATURES):
+            raise RuntimeError("clock feature schema mismatch")
+        # Preserve the original first five clock positions so legacy
+        # checkpoints keep the exact feature layout they were trained on.
+        out = [clock_values[name] for name in LEGACY_CLOCK_FEATURES]
 
         market = self._get(observation, "market", {}) or {}
         inventory = self._get(market, "inventory", {}) or {}
@@ -207,6 +224,13 @@ class ObservationEncoder:
                 out.extend([0.0] * 21)
             else:
                 out.extend(self._tile_features(self._tile_at(own, pos), day))
+
+        if self.clock_schema == "v4":
+            # Use padding space for new V4 time signals instead of shifting
+            # any legacy market/farm/private feature index.
+            out.extend(
+                clock_values[name] for name in V4_CLOCK_EXTRA_FEATURES
+            )
 
         arr = np.zeros(self.size, dtype=np.float32)
         n = min(len(out), self.size)

@@ -74,3 +74,20 @@ def test_v4_residual_exception_falls_back_to_macro():
 
     policy = FarmOSV4HybridPolicy(residual=explode)
     assert policy.act(obs) == base
+
+
+def test_v4_residual_receives_canonical_step_when_raw_step_is_missing():
+    seen = {}
+
+    def residual(obs, config, base):
+        seen.update(step=obs["step"], day=obs["day"], hour=obs["hour"])
+        return None
+
+    policy = FarmOSV4HybridPolicy(residual=residual)
+    policy.act({
+        "player": 1,
+        "day": 1,
+        "hour": 3,
+        "town": {"unlocked_shops": []},
+    })
+    assert seen == {"step": 27, "day": 1, "hour": 3}

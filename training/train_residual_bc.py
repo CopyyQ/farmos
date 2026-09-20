@@ -11,9 +11,13 @@ import torch
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from kaggrl.clock import CLOCK_FEATURES
 from kaggrl.residual_model import ResidualPolicy, residual_bc_loss
 
 DATASET = ROOT / "data" / "top_tier" / "residual_bc_2026-09-12_14.parquet"
+MANIFEST = ROOT / "data" / "top_tier" / "manifests" / "residual_bc_2026-09-12_14.json"
+OBSERVATION_SCHEMA = "macro_semantic_v4_clock_v2"
+TARGET_SCHEMA = "legacy_market2_edit_v1"
 OUT = ROOT / "checkpoints" / "residual_bc_top10_2026-09-12_14.pt"
 VOCAB_OUT = ROOT / "checkpoints" / "residual_bc_top10_order_vocab.json"
 METRICS_OUT = ROOT / "checkpoints" / "residual_bc_top10_metrics.json"
@@ -24,6 +28,28 @@ EPOCHS = 8
 LR = 2e-3
 SEED = 20260917
 UNK = "<UNK>"
+
+
+def validate_dataset_schema():
+    if not MANIFEST.is_file():
+        raise RuntimeError(
+            "residual dataset manifest is missing; rebuild the V4 dataset"
+        )
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    if manifest.get("observation_schema") != OBSERVATION_SCHEMA:
+        raise RuntimeError(
+            "stale residual observation schema; rebuild with "
+            "training/build_residual_dataset.py"
+        )
+    if manifest.get("clock_features") != list(CLOCK_FEATURES):
+        raise RuntimeError(
+            "residual clock feature schema mismatch; rebuild the dataset"
+        )
+    if manifest.get("target_schema") != TARGET_SCHEMA:
+        raise RuntimeError(
+            "residual target schema mismatch; this trainer is only for the "
+            "legacy first-two-market-order diagnostic, not V4 Options"
+        )
 
 
 def build_vocab(frame):
@@ -123,6 +149,7 @@ def evaluate(model, x, frame, order_ids, split):
 
 
 def main():
+    validate_dataset_schema()
     torch.set_num_threads(4)
     torch.manual_seed(SEED)
     rng = np.random.default_rng(SEED)
@@ -155,7 +182,16 @@ def main():
         print(json.dumps(row), flush=True)
         if val["row_exact_acc"] > best_val:
             best_val = val["row_exact_acc"]
-            torch.save({"model": model.state_dict(), "input_dim": INPUT_DIM, "hidden_dim": HIDDEN, "order_vocab_size": len(vocab), "epoch": epoch}, OUT)
+            torch.save({
+                "model": model.state_dict(),
+                "input_dim": INPUT_DIM,
+                "hidden_dim": HIDDEN,
+                "order_vocab_size": len(vocab),
+                "epoch": epoch,
+                "observation_schema": OBSERVATION_SCHEMA,
+                "clock_features": list(CLOCK_FEATURES),
+                "target_schema": TARGET_SCHEMA,
+            }, OUT)
     saved = torch.load(OUT, map_location="cpu", weights_only=False)
     model.load_state_dict(saved["model"])
     model.eval()

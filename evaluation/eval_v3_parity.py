@@ -84,13 +84,17 @@ def compare_v3_fixture(checkpoint, npz_path, fixture, atol: float = 5e-4):
                 - np.asarray(rrow["raw_logits"], np.float64)
             ))),
         )
-        max_masked = max(
-            max_masked,
-            float(np.max(np.abs(
-                np.asarray(lrow["masked_logits"], np.float64)
-                - np.asarray(rrow["masked_logits"], np.float64)
-            ))),
-        )
+        # Illegal entries may use different finite -inf sentinels in
+        # Torch and NumPy. mask_equal already checks legality parity, so logit
+        # parity is meaningful only on entries that are legal on both sides.
+        legal = np.asarray(lrow["legal_mask"], dtype=bool)
+        if legal.any():
+            left_masked = np.asarray(lrow["masked_logits"], np.float64)[legal]
+            right_masked = np.asarray(rrow["masked_logits"], np.float64)[legal]
+            max_masked = max(
+                max_masked,
+                float(np.max(np.abs(left_masked - right_masked))),
+            )
     fixture_action_equal = (
         numpy_trace["canonical_action"] == fixture["canonical_action"]
         and numpy_trace["engine_action"] == fixture["engine_action"]

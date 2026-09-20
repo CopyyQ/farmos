@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from kaggle_environments import make
+from kaggrl.clock import resolve_clock
 from rollout.v4_hybrid_agent import V4HybridRolloutAgent
 
 
@@ -29,6 +30,41 @@ def _resolve_opponent(path: str | Path) -> Path:
     if not value.is_file():
         raise FileNotFoundError(value)
     return value
+
+
+def _audit_clock(env) -> dict:
+    seats = []
+    for seat in (0, 1):
+        missing_raw_step = 0
+        mismatches = []
+        for index, frame in enumerate(env.steps):
+            obs = dict(frame[seat].observation)
+            missing_raw_step += int(obs.get("step") is None)
+            clock = resolve_clock(obs, env.configuration)
+            if clock.step != index:
+                mismatches.append({
+                    "frame": index,
+                    "resolved_step": clock.step,
+                    "day": clock.day,
+                    "hour": clock.hour,
+                })
+        seats.append({
+            "seat": seat,
+            "frames": len(env.steps),
+            "missing_raw_step": missing_raw_step,
+            "resolved_first": resolve_clock(
+                dict(env.steps[0][seat].observation), env.configuration
+            ).step,
+            "resolved_last": resolve_clock(
+                dict(env.steps[-1][seat].observation), env.configuration
+            ).step,
+            "mismatch_count": len(mismatches),
+            "mismatch_examples": mismatches[:5],
+        })
+    return {
+        "ok": all(row["mismatch_count"] == 0 for row in seats),
+        "seats": seats,
+    }
 
 
 def match_v4_vs_agent(
@@ -56,6 +92,7 @@ def match_v4_vs_agent(
                 debug=False,
             )
             env.run(agents)
+            clock_audit = _audit_clock(env)
             final = env.steps[-1]
             statuses = [str(agent.status) for agent in final]
             observation = final[0].observation
@@ -69,6 +106,7 @@ def match_v4_vs_agent(
                 "opponent_money": rival,
                 "margin": own - rival,
                 "statuses": statuses,
+                "clock_audit": clock_audit,
             })
 
     margins = [row["margin"] for row in records]
@@ -86,6 +124,7 @@ def match_v4_vs_agent(
         "runtime_ok": all(
             row["statuses"] == ["DONE", "DONE"] for row in records
         ),
+        "clock_ok": all(row["clock_audit"]["ok"] for row in records),
     }
 
     if output_dir is None:
@@ -117,10 +156,16 @@ def match_v4_vs_agent(
             "WIN" if row["margin"] > 0
             else ("LOSS" if row["margin"] < 0 else "TIE")
         )
+        missing = [
+            item["missing_raw_step"]
+            for item in row["clock_audit"]["seats"]
+        ]
         print(
             f"seed={row['seed']} seat={row['seat']} {result} "
             f"money={row['money']} opponent={row['opponent_money']} "
-            f"margin={row['margin']:+d}"
+            f"margin={row['margin']:+d} "
+            f"clock_ok={row['clock_audit']['ok']} "
+            f"raw_step_missing={missing}"
         )
     print(
         f"TOTAL games={summary['games']} wins={summary['wins']} "
@@ -128,7 +173,8 @@ def match_v4_vs_agent(
         f"win_rate={summary['win_rate']:.1%} "
         f"mean_money={summary['mean_money']:.1f} "
         f"mean_margin={summary['mean_margin']:+.1f} "
-        f"runtime_ok={summary['runtime_ok']}"
+        f"runtime_ok={summary['runtime_ok']} "
+        f"clock_ok={summary['clock_ok']}"
     )
     print(f"REPORT={report_path}")
     print(

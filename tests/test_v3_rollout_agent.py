@@ -118,3 +118,22 @@ def test_strategy_rollout_uses_fixed_override_slot(tmp_path):
     assert action == expected.engine_action
     assert agent.last_metadata["strategy_slot"] == 1
     assert agent.strategy_slot == 1
+
+
+def test_v3_rollout_reconstructs_missing_step_for_temporal_lifecycle(tmp_path):
+    agent = V3NumpyRolloutAgent(
+        _model(tmp_path), seed=37, deterministic=True,
+        capture_decision_trace=True,
+    )
+    first = _obs(0, hands=0)
+    second = _obs(1, hands=0)
+    first.pop("step")
+    second.pop("step")
+    agent(first)
+    agent(second)
+    assert agent.last_metadata["step"] == 1
+    assert agent.last_metadata["day"] == 0
+    assert agent.last_metadata["hour"] == 1
+    assert agent.last_metadata["remaining_steps"] == 718
+    assert agent.last_metadata["temporal_valid_length"] == 2
+    assert agent.diagnostic_fixtures[-1]["structured_state"]["step"] == 1

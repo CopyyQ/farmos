@@ -43,3 +43,19 @@ def test_encoder_is_canonical_across_player_seats():
     obs1["player"] = 1
     # private belongs to the acting player in both observations.
     np.testing.assert_allclose(enc.encode(obs0), enc.encode(obs1), atol=0.0, rtol=0.0)
+
+
+def test_encoder_clock_is_identical_with_explicit_or_missing_step():
+    from kaggrl.observation import ObservationEncoder
+
+    enc = ObservationEncoder(clock_schema="v4")
+    explicit = deepcopy(_obs())
+    explicit["step"], explicit["day"], explicit["hour"] = 675, 28, 3
+    missing = deepcopy(explicit)
+    missing.pop("step")
+    np.testing.assert_allclose(
+        enc.encode(explicit),
+        enc.encode(missing),
+        atol=0.0,
+        rtol=0.0,
+    )

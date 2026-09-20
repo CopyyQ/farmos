@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from kaggrl.clock import CLOCK_FEATURES
 from kaggrl.macro_policy import MacroPolicy
 from kaggrl.observation import ObservationEncoder
 from kaggrl.residual_dataset import derive_market_residual, episode_split, participant_seat, sample_residual_row
@@ -24,6 +25,7 @@ OUT = ROOT / "data" / "top_tier" / "residual_bc_2026-09-12_14.parquet"
 MANIFEST = ROOT / "data" / "top_tier" / "manifests" / "residual_bc_2026-09-12_14.json"
 DATES = ("2026-09-12", "2026-09-13", "2026-09-14")
 EDIT_ID = {"KEEP": 0, "DROP": 1, "REPLACE": 2}
+TARGET_SCHEMA = "legacy_market2_edit_v1"
 BATCH_ROWS = 1024
 
 SCHEMA = pa.schema([
@@ -58,7 +60,7 @@ def flush(writer, rows):
 
 
 def main():
-    encoder = ObservationEncoder()
+    encoder = ObservationEncoder(clock_schema="v4")
     routes, new_map, old_map = load_v45_macro_data()
     meta = pd.read_parquet(
         DATA / "episodes.parquet",
@@ -94,7 +96,10 @@ def main():
                     stats["perspectives"] += 1
                     for step in range(len(replay["steps"]) - 1):
                         obs = dict(replay["steps"][step][seat]["observation"])
-                        obs.setdefault("step", step)
+                        # Replay frame index is authoritative for training time.
+                        obs["step"] = step
+                        obs.setdefault("day", step // 24)
+                        obs.setdefault("hour", step % 24)
                         teacher = replay["steps"][step + 1][seat].get("action") or {
                             "farmer": ["PASS"], "hands": [], "market": []
                         }
@@ -156,6 +161,11 @@ def main():
         "selected_order_vocab_size": len(order_vocab),
         "observation_dim": encoder.size,
         "observation_storage": "float16 bytes, little-endian native NumPy",
+        "observation_schema": "macro_semantic_v4_clock_v2",
+        "clock_features": list(CLOCK_FEATURES),
+        "target_schema": TARGET_SCHEMA,
+        "target_scope": "first_two_market_orders_only",
+        "temporal_context": "single_step_rows",
         "selection": {"changed_modulus": 16, "keep_modulus": 32},
         "split": "sha256(episode_id) mod 10: 0=test, 1=val, else=train",
     }

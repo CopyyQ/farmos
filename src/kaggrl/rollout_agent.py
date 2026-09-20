@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from .actions import ActionCodec
+from .clock import resolve_clock
 from .observation import ObservationEncoder
 from .structured_numpy_runtime import StructuredNumpyPolicy
 
@@ -34,12 +35,12 @@ class NumpyRolloutAgent:
         self.state_reset_count += 1
     def __call__(self, obs, configuration=None):
         player = int(obs["player"])
-        step = int(obs["step"])
+        step = resolve_clock(obs, configuration).step
         if step == 0 or step <= self.last_step:
             self.reset(player)
         elif self.memory_horizon and step % self.memory_horizon == 0:
             self.reset_memory()
-        encoded = self.encoder.encode(obs)
+        encoded = self.encoder.encode(obs, configuration)
         hand_count = len(obs["farms"][player]["hands"])
         tokens, mask, logp, value, state2 = self.policy.sample_step(
             encoded, self.state, hand_count, self.rng, self.deterministic

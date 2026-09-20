@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .clock import resolve_clock
 from .macro_policy import MacroPolicy
 from .residual_actions import ResidualAction, apply_residual
 from .v45_macro_data import load_v45_macro_data
@@ -46,7 +47,13 @@ class FarmOSV4HybridPolicy:
 
     def act(self, observation, configuration=None) -> dict[str, Any]:
         obs = dict(observation)
-        step = MacroPolicy._step(obs, configuration)
+        clock = resolve_clock(obs, configuration)
+        step = clock.step
+        # Seat 1 does not expose observation["step"] in the current engine.
+        # Canonicalize the clock at the V4 boundary so every residual sees it.
+        obs["step"] = step
+        obs["day"] = clock.day
+        obs["hour"] = clock.hour
         if step == 0 and self._last_step not in {None, 0}:
             self.base.reset()
         self._last_step = step

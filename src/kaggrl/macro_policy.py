@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 
+from .clock import resolve_step
+
 
 class MacroPolicy:
     def __init__(self, routes, new_shop_routes, old_shop_routes):
@@ -17,20 +19,8 @@ class MacroPolicy:
 
     @staticmethod
     def _step(observation, configuration=None):
-        """Return a robust absolute turn index."""
-        raw_step = observation.get("step")
-        if raw_step is not None:
-            return int(raw_step)
-        turns_per_day = 24
-        if configuration is not None:
-            if isinstance(configuration, dict):
-                turns_per_day = int(configuration.get("turnsPerDay", turns_per_day))
-            else:
-                turns_per_day = int(getattr(configuration, "turnsPerDay", turns_per_day))
-        return (
-            int(observation.get("day", 0) or 0) * turns_per_day
-            + int(observation.get("hour", 0) or 0)
-        )
+        """Return the canonical absolute turn index for either seat."""
+        return resolve_step(observation, configuration)
 
     def _advance_route(self, observation, configuration=None):
         step = self._step(observation, configuration)

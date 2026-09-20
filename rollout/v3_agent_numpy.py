@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from kaggrl.clock import resolve_clock
 from kaggrl.v2_effect_tracker import EffectRecord, EffectTracker
 from kaggrl.v2_observation import normalize_observation
 from kaggrl.v3_numpy_runtime import V3NumpyPolicy
@@ -90,9 +91,12 @@ class V3NumpyRolloutAgent:
         return record.to_model_effect()
 
     def act(self, observation: dict[str, Any], configuration=None):
-        del configuration
         observation = _plain(observation)
-        step = int(observation.get("step", 0))
+        clock = resolve_clock(observation, configuration)
+        step = clock.step
+        observation["step"] = step
+        observation["day"] = clock.day
+        observation["hour"] = clock.hour
         player = int(observation.get("player", 0))
         reset = self._needs_reset(step, player)
         if reset:
@@ -128,6 +132,9 @@ class V3NumpyRolloutAgent:
         self.pending_requested_action = deepcopy(output.engine_action)
         self.last_metadata = {
             "step": step,
+            "day": clock.day,
+            "hour": clock.hour,
+            "remaining_steps": clock.remaining_steps,
             "player": player,
             "episode_index": self.episode_index,
             "reset": reset,

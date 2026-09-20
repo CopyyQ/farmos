@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+from kaggrl.clock import resolve_step
 from kaggrl.constants import UNIT_OPS
 from kaggrl.v2_action_schema import parse_raw_action
 from kaggrl.v2_effect_tracker import EffectTracker
@@ -375,7 +376,7 @@ class _RecoveryCollectingAgent:
         obs_plain = _plain(observation)
         self.label_errors.append({
             "stage": str(stage),
-            "step": int(obs_plain.get("step", -1)),
+            "step": resolve_step(obs_plain),
             "player": int(obs_plain.get("player", self.seat)),
             "error_type": type(error).__name__,
             "error": str(error),
@@ -845,7 +846,7 @@ def collect_teacher_demonstrations(
                 row = {
                     "episode_id": episode_id,
                     "seat": int(seat),
-                    "step": int(obs_plain.get("step", index)),
+                    "step": resolve_step(obs_plain, env.configuration),
                     "state": structured_state,
                     "canonical_action": projected,
                     "previous_action": deepcopy(previous_action),

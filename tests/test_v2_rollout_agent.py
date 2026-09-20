@@ -99,3 +99,18 @@ def test_rollout_agent_accepts_kaggle_struct_observation(tmp_path):
     action = agent(_structify(_obs(0, hands=1)))
     assert set(action) == {"farmer", "hands", "market"}
     assert len(agent.telemetry) == 1
+
+
+def test_v2_rollout_reconstructs_missing_step_for_lifecycle(tmp_path):
+    agent = V2NumpyRolloutAgent(_model(tmp_path), seed=25, deterministic=True)
+    first = _obs(0, hands=0)
+    second = _obs(1, hands=0)
+    first.pop("step")
+    second.pop("step")
+    agent(first)
+    agent(second)
+    assert agent.last_metadata["step"] == 1
+    assert agent.last_metadata["day"] == 0
+    assert agent.last_metadata["hour"] == 1
+    assert agent.last_metadata["remaining_steps"] == 718
+    assert agent.reset_count == 1
