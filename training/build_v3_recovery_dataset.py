@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from kaggrl.constants import UNIT_OPS
 from kaggrl.v2_action_schema import parse_raw_action
+from kaggrl.v2_effect_tracker import EffectTracker
 from kaggrl.v2_ledger import MARKET_OPS, ShadowLedger
 from kaggrl.v2_observation import normalize_observation
 
@@ -730,6 +731,18 @@ def collect_teacher_recovery(
 
 
 
+def _terminal_outcome(observation: dict[str, Any]) -> tuple[int, int, int]:
+    player = int(observation.get("player", 0))
+    farms = observation.get("farms") or []
+    if not isinstance(farms, list) or len(farms) < 2:
+        return 0, 0, 0
+    own = int((farms[player] or {}).get("money", 0) or 0)
+    rival = int((farms[1 - player] or {}).get("money", 0) or 0)
+    margin = own - rival
+    result = 1 if margin > 0 else (-1 if margin < 0 else 0)
+    return own, margin, result
+
+
 def collect_teacher_demonstrations(
     teacher_path: Path,
     output_path: Path,
@@ -786,16 +799,30 @@ def collect_teacher_demonstrations(
         per_game_rows = 0
         per_game_dropped = 0
         for seat in (0, 1):
+            tracker = EffectTracker()
             previous_action: dict[str, Any] = {}
+            previous_effect: dict[str, Any] = {}
+            final_obs = _plain(env.steps[-1][seat].observation)
+            final_own_money, final_margin, terminal_result = (
+                _terminal_outcome(final_obs)
+            )
             episode_id = int(seed) * 10 + int(seat)
             for index in range(max(0, len(env.steps) - 1)):
                 state_agent = env.steps[index][seat]
                 action_agent = env.steps[index + 1][seat]
                 obs_plain = _plain(state_agent.observation)
+                next_obs_plain = _plain(
+                    env.steps[index + 1][seat].observation
+                )
                 raw_action = _plain(action_agent.action or {})
                 canonical = canonicalize_teacher_action(
                     raw_action, obs_plain
                 )
+                effects = tracker.observe(
+                    obs_plain,
+                    raw_action,
+                    next_obs_plain,
+                ).to_model_effect()
                 structured_state = asdict(
                     normalize_observation(obs_plain)
                 )
@@ -809,7 +836,8 @@ def collect_teacher_demonstrations(
                 if int(corrections) > 0:
                     dropped_projected_rows += 1
                     per_game_dropped += 1
-                    previous_action = projected
+                    previous_action = canonical
+                    previous_effect = effects
                     continue
 
                 row = {
@@ -819,11 +847,11 @@ def collect_teacher_demonstrations(
                     "state": structured_state,
                     "canonical_action": projected,
                     "previous_action": deepcopy(previous_action),
-                    "previous_effect": {},
-                    "effects": {},
-                    "final_own_money": 0,
-                    "final_margin": 0,
-                    "terminal_result": 0,
+                    "previous_effect": deepcopy(previous_effect),
+                    "effects": deepcopy(effects),
+                    "final_own_money": int(final_own_money),
+                    "final_margin": int(final_margin),
+                    "terminal_result": int(terminal_result),
                     "teacher_id": resolved_teacher_id,
                     "teacher_version": teacher_version,
                     "supervision_kind": "accepted_policy",
@@ -833,7 +861,8 @@ def collect_teacher_demonstrations(
                 validate_recovery_row(row)
                 rows.append(row)
                 per_game_rows += 1
-                previous_action = projected
+                previous_action = canonical
+                previous_effect = effects
 
         game_summaries.append({
             "seed": int(seed),

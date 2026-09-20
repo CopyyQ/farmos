@@ -5,11 +5,21 @@ from dataclasses import asdict
 from kaggrl.v2_observation import normalize_observation
 from training.build_v3_recovery_dataset import (
     _RecoveryCollectingAgent,
+    _terminal_outcome,
     canonicalize_teacher_action,
     project_teacher_action_to_executable,
     teacher_id_from_path,
     validate_recovery_row,
 )
+
+
+def test_terminal_outcome_reads_player_relative_money():
+    obs = _observation()
+    obs["farms"][0]["money"] = 12345
+    obs["farms"][1]["money"] = 10000
+    assert _terminal_outcome(obs) == (12345, 2345, 1)
+    obs["player"] = 1
+    assert _terminal_outcome(obs) == (10000, -2345, -1)
 
 
 def test_teacher_id_from_extracted_directory():
