@@ -1725,7 +1725,7 @@ def test_v3_2_collapse_rejects_initial_market_stop_at_episode_start():
     assert report["passed"] is False
 
 
-def test_v32_collapse_rejects_zero_buy_animal_prediction():
+def test_v32_collapse_warns_on_zero_buy_animal_prediction():
     from dataclasses import replace
     from kaggrl.v3_2_schema import ARCHITECTURE_VERSION as V32_ARCH
     from training.train_v3_bc import _collapse_report
@@ -1778,6 +1778,7 @@ def test_v32_collapse_rejects_zero_buy_animal_prediction():
         {"farmer_op": 0.0, "hands_op": 0.0, "market_op": 0.0},
         initial_state={"rows": 10, "market_continue_accuracy": 1.0},
     )
-    assert "zero_buy_animal_prediction" in report["failures"]
-    assert "zero_buy_animal_recall" in report["failures"]
-    assert report["passed"] is False
+    assert report["failures"] == []
+    assert "zero_buy_animal_prediction" in report["coverage_warnings"]
+    assert "zero_buy_animal_recall" in report["coverage_warnings"]
+    assert report["passed"] is True

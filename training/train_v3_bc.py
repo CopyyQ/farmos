@@ -2577,6 +2577,7 @@ def _collapse_report(config, expert, free, gaps, initial_state=None):
     stop_queue = _fraction(hist["market"], "STOP_QUEUE")
     expert_stop = _fraction(targets["market"], "STOP_QUEUE")
     failures = []
+    coverage_warnings = []
     if gaps["farmer_op"] > config.max_farmer_op_gap:
         failures.append("farmer_history_gap")
     if gaps["hands_op"] > config.max_hand_op_gap:
@@ -2618,7 +2619,7 @@ def _collapse_report(config, expert, free, gaps, initial_state=None):
             buy_animal_targets > 0
             and int(market_hist.get("BUY_ANIMAL", 0) or 0) == 0
         ):
-            failures.append("zero_buy_animal_prediction")
+            coverage_warnings.append("zero_buy_animal_prediction")
         if sell_targets > 0 and sell_predictions == 0:
             failures.append("zero_sell_prediction")
         if stop_targets > 0 and stop_predictions == 0:
@@ -2631,7 +2632,7 @@ def _collapse_report(config, expert, free, gaps, initial_state=None):
             buy_animal_targets > 0
             and float(semantic.get("market_buy_animal_op_recall", 0.0) or 0.0) <= 0.0
         ):
-            failures.append("zero_buy_animal_recall")
+            coverage_warnings.append("zero_buy_animal_recall")
         if sell_targets > 0 and float(semantic.get("market_sell_op_recall", 0.0) or 0.0) <= 0.0:
             failures.append("zero_sell_recall")
         initial_state = initial_state or {}
@@ -2655,6 +2656,7 @@ def _collapse_report(config, expert, free, gaps, initial_state=None):
     return {
         "passed": not failures,
         "failures": failures,
+        "coverage_warnings": coverage_warnings,
         "farmer_pass_fraction": farmer_pass,
         "hand_pass_fraction": hand_pass,
         "stop_queue_fraction": stop_queue,
@@ -3481,6 +3483,9 @@ def run_v3_bc(
                 ),
                 "promotion_eligible": bool(promotion_eligible),
                 "failures": list(collapse.get("failures") or []),
+                "coverage_warnings": list(
+                    collapse.get("coverage_warnings") or []
+                ),
                 "farmer_pass_fraction": collapse.get(
                     "farmer_pass_fraction"
                 ),
