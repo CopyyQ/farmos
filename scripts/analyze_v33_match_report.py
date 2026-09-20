@@ -60,11 +60,8 @@ def main() -> None:
         "mean_final_money": float(statistics.fmean(
             float(game["final_money"]) for game in games
         )),
-        "logistics_completion_ratio": float(
-            (
-                effects.get("deposit", 0)
-                + effects.get("sale", 0)
-            )
+        "deposit_completion_ratio": float(
+            effects.get("deposit", 0)
             / max(
                 1,
                 effects.get("harvest", 0)
@@ -103,8 +100,8 @@ def main() -> None:
             "effective_total": result["effective_total"],
             "economy_families": result["economy_families"],
             "mean_final_money": result["mean_final_money"],
-            "logistics_completion_ratio": result[
-                "logistics_completion_ratio"
+            "deposit_completion_ratio": result[
+                "deposit_completion_ratio"
             ],
         }, sort_keys=True),
         flush=True,
