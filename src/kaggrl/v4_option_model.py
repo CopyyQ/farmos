@@ -17,6 +17,9 @@ class V4OptionLoss:
     market: torch.Tensor
     phase: torch.Tensor
     clock: torch.Tensor
+    value: torch.Tensor
+    route_value: torch.Tensor
+    market_value: torch.Tensor
 
 
 class V4OptionPolicy(nn.Module):
@@ -78,6 +81,18 @@ class V4OptionPolicy(nn.Module):
         self.value_clock_head = nn.Linear(
             self.clock_dim, 1, bias=False,
         )
+        self.route_value_head = nn.Linear(
+            self.hidden_dim, self.route_count
+        )
+        self.route_value_clock_head = nn.Linear(
+            self.clock_dim, self.route_count, bias=False
+        )
+        self.market_value_head = nn.Linear(
+            self.hidden_dim, self.market_mode_count
+        )
+        self.market_value_clock_head = nn.Linear(
+            self.clock_dim, self.market_mode_count, bias=False
+        )
 
         # Phase is deterministic clock metadata. Seed a strong direct mapping
         # instead of making the recurrent core rediscover calendar boundaries.
@@ -93,6 +108,8 @@ class V4OptionPolicy(nn.Module):
             self.route_gate_clock_head.weight.zero_()
             self.market_clock_head.weight.zero_()
             self.value_clock_head.weight.zero_()
+            self.route_value_clock_head.weight.zero_()
+            self.market_value_clock_head.weight.zero_()
             self.phase_clock_head.weight.zero_()
             for phase_index in range(5):
                 self.phase_clock_head.weight[
@@ -125,6 +142,8 @@ class V4OptionPolicy(nn.Module):
         market_clock = self.market_clock_head(clock_context)
         phase_clock = self.phase_clock_head(clock_context)
         value_clock = self.value_clock_head(clock_context).squeeze(-1)
+        route_value_clock = self.route_value_clock_head(clock_context)
+        market_value_clock = self.market_value_clock_head(clock_context)
         step_index = CLOCK_FEATURES.index("step_norm")
         remaining_index = CLOCK_FEATURES.index("remaining_steps_norm")
         exact_clock = torch.stack(
@@ -144,10 +163,29 @@ class V4OptionPolicy(nn.Module):
             "route_clock": route_clock,
             "market_clock": market_clock,
             "value": self.value_head(y).squeeze(-1) + value_clock,
+            "route_value": (
+                self.route_value_head(y) + route_value_clock
+            ),
+            "market_value": (
+                self.market_value_head(y) + market_value_clock
+            ),
         }, state
 
 
-def _weighted_route_ce(logits, targets, confidence, route_mask=None):
+def _weighted_mean(per, weight):
+    if weight is None:
+        return per.mean()
+    flat_weight = weight.reshape(-1).to(per.dtype).clamp_min(0.0)
+    flat_per = per.reshape(-1)
+    denom = flat_weight.sum()
+    if float(denom.detach().cpu()) <= 0.0:
+        return flat_per.sum() * 0.0
+    return (flat_per * flat_weight).sum() / denom
+
+
+def _weighted_route_ce(
+    logits, targets, confidence, route_mask=None, sample_weight=None
+):
     if route_mask is not None:
         if route_mask.shape != logits.shape:
             raise ValueError(
@@ -167,6 +205,8 @@ def _weighted_route_ce(logits, targets, confidence, route_mask=None):
     flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_targets = targets.reshape(-1)
     flat_conf = confidence.reshape(-1).to(flat_logits.dtype).clamp(0.0, 1.0)
+    if sample_weight is not None:
+        flat_conf = flat_conf * sample_weight.reshape(-1).to(flat_logits.dtype)
     per = F.cross_entropy(flat_logits, flat_targets, reduction="none")
     denom = flat_conf.sum()
     if float(denom.detach().cpu()) <= 0.0:
@@ -184,6 +224,8 @@ def v4_option_loss(
     market_target,
     phase_target,
     clock_target,
+    value_target=None,
+    policy_weight=None,
     market_class_weight=None,
     route_gate_pos_weight=None,
     route_weight: float = 1.0,
@@ -191,23 +233,31 @@ def v4_option_loss(
     market_weight: float = 1.00,
     phase_weight: float = 1.00,
     clock_weight: float = 2.00,
+    value_weight: float = 0.25,
+    route_value_weight: float = 1.00,
+    market_value_weight: float = 1.00,
 ) -> V4OptionLoss:
     route = _weighted_route_ce(
         outputs["route"],
         route_target,
         route_confidence,
         route_mask=route_mask,
+        sample_weight=policy_weight,
     )
-    route_gate = F.binary_cross_entropy_with_logits(
+    route_gate_per = F.binary_cross_entropy_with_logits(
         outputs["route_gate_logits"],
         route_gate_target.to(outputs["route_gate_logits"].dtype),
         pos_weight=route_gate_pos_weight,
+        reduction="none",
     )
-    market = F.cross_entropy(
+    route_gate = _weighted_mean(route_gate_per, policy_weight)
+    market_per = F.cross_entropy(
         outputs["market"].reshape(-1, outputs["market"].shape[-1]),
         market_target.reshape(-1),
         weight=market_class_weight,
+        reduction="none",
     )
+    market = _weighted_mean(market_per, policy_weight)
     phase = F.cross_entropy(
         outputs["phase"].reshape(-1, outputs["phase"].shape[-1]),
         phase_target.reshape(-1),
@@ -216,12 +266,47 @@ def v4_option_loss(
         outputs["clock"],
         clock_target.to(outputs["clock"].dtype),
     )
+    if value_target is None:
+        anchor = outputs.get("value", outputs["route"])
+        value = anchor.sum() * 0.0
+        route_value = anchor.sum() * 0.0
+        market_value = anchor.sum() * 0.0
+    else:
+        target_value = value_target.to(outputs["value"].dtype)
+        value = F.smooth_l1_loss(
+            outputs["value"],
+            target_value,
+        )
+        if "route_value" in outputs:
+            route_selected = outputs["route_value"].gather(
+                -1, route_target.unsqueeze(-1)
+            ).squeeze(-1)
+            route_value_per = F.smooth_l1_loss(
+                route_selected, target_value, reduction="none"
+            )
+            route_value = _weighted_mean(
+                route_value_per, route_confidence
+            )
+        else:
+            route_value = value * 0.0
+        if "market_value" in outputs:
+            market_selected = outputs["market_value"].gather(
+                -1, market_target.unsqueeze(-1)
+            ).squeeze(-1)
+            market_value = F.smooth_l1_loss(
+                market_selected, target_value
+            )
+        else:
+            market_value = value * 0.0
     total = (
         float(route_weight) * route
         + float(route_gate_weight) * route_gate
         + float(market_weight) * market
         + float(phase_weight) * phase
         + float(clock_weight) * clock
+        + float(value_weight) * value
+        + float(route_value_weight) * route_value
+        + float(market_value_weight) * market_value
     )
     return V4OptionLoss(
         total=total,
@@ -230,6 +315,9 @@ def v4_option_loss(
         market=market,
         phase=phase,
         clock=clock,
+        value=value,
+        route_value=route_value,
+        market_value=market_value,
     )
 
 

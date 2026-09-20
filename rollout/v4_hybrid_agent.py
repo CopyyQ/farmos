@@ -12,12 +12,16 @@ class V4HybridRolloutAgent:
         option_policy=None,
         min_confidence: float = 0.80,
         min_option_confidence: float = 0.65,
+        enable_market_race_ordering: bool = True,
+        market_race_min_gain: float = 1.0,
     ):
         self.policy = FarmOSV4HybridPolicy(
             residual=None,
             option_policy=option_policy,
             min_confidence=min_confidence,
             min_option_confidence=min_option_confidence,
+            enable_market_race_ordering=enable_market_race_ordering,
+            market_race_min_gain=market_race_min_gain,
         )
 
     def reset(self) -> None:

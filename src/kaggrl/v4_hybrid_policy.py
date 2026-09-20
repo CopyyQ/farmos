@@ -5,6 +5,12 @@ from typing import Any, Callable
 from .clock import resolve_clock
 from .macro_policy import MacroPolicy
 from .residual_actions import ResidualAction, apply_residual
+from .v4_market_race import (
+    MarketRaceTracker,
+    front_run_future_sales,
+    optimize_sell_order,
+    suppress_due_sales,
+)
 from .v4_options import (
     StepStrategyContext,
     V4Option,
@@ -28,6 +34,8 @@ class FarmOSV4HybridPolicy:
         option_policy: OptionFn | None = None,
         min_confidence: float = 0.80,
         min_option_confidence: float = 0.65,
+        enable_market_race_ordering: bool = True,
+        market_race_min_gain: float = 1.0,
     ):
         routes, new_routes, old_routes = load_v45_macro_data()
         self.base = MacroPolicy(routes, new_routes, old_routes)
@@ -36,11 +44,21 @@ class FarmOSV4HybridPolicy:
         self.min_confidence = float(min_confidence)
         self.min_option_confidence = float(min_option_confidence)
         self.route_ids = tuple(sorted(int(key) for key in routes))
+        self.enable_market_race_ordering = bool(
+            enable_market_race_ordering
+        )
+        self.market_race_min_gain = float(market_race_min_gain)
+        self.market_race = MarketRaceTracker()
+        self.front_run_debts: dict[
+            tuple[int, int], dict[str, int]
+        ] = {}
         self._last_step: int | None = None
         self.last_strategy: dict[str, Any] | None = None
 
     def reset(self) -> None:
         self.base.reset()
+        self.market_race.reset()
+        self.front_run_debts = {}
         self._last_step = None
         self.last_strategy = None
 
@@ -85,7 +103,10 @@ class FarmOSV4HybridPolicy:
         obs["hour"] = clock.hour
         if step == 0 and self._last_step not in {None, 0}:
             self.base.reset()
+            self.market_race.reset()
+            self.front_run_debts = {}
         self._last_step = step
+        self.market_race.observe(obs)
 
         base_route_id = self.base.route_id(obs, configuration)
         base_action = self.base.action_for_route(
@@ -133,6 +154,50 @@ class FarmOSV4HybridPolicy:
                 option_confidence = 0.0
                 option_applied = False
 
+        # A sale pulled forward earlier is removed from its original due step.
+        for debt_key in [
+            key for key in self.front_run_debts
+            if key[1] < step
+        ]:
+            self.front_run_debts.pop(debt_key, None)
+        due_debt = self.front_run_debts.pop(
+            (int(selected_route), int(step)), None
+        )
+        action = suppress_due_sales(action, due_debt)
+
+        front_run_metadata = None
+        if market_mode in {"FRONT_RUN_1", "FRONT_RUN_9"}:
+            horizon = 1 if market_mode == "FRONT_RUN_1" else 9
+            existing_route_debts = {
+                int(due_step): dict(debt)
+                for (route_id, due_step), debt
+                in self.front_run_debts.items()
+                if int(route_id) == int(selected_route)
+            }
+            action, new_debts = front_run_future_sales(
+                obs,
+                action,
+                self.base,
+                int(selected_route),
+                configuration,
+                horizon=horizon,
+                existing_debts=existing_route_debts,
+            )
+            for due_step, debt in new_debts.items():
+                key = (int(selected_route), int(due_step))
+                merged = self.front_run_debts.setdefault(key, {})
+                for item, quantity in debt.items():
+                    merged[item] = merged.get(item, 0) + int(quantity)
+            front_run_metadata = {
+                "horizon": horizon,
+                "due_steps": sorted(int(x) for x in new_debts),
+                "pulled_units": sum(
+                    int(quantity)
+                    for debt in new_debts.values()
+                    for quantity in debt.values()
+                ),
+            }
+
         self.last_strategy = {
             "step": step,
             "day": clock.day,
@@ -144,19 +209,47 @@ class FarmOSV4HybridPolicy:
             "market_mode": market_mode,
             "option_confidence": float(option_confidence),
             "option_applied": bool(option_applied),
+            "front_run": front_run_metadata,
         }
 
-        if self.residual is None:
-            return action
+        if self.residual is not None:
+            try:
+                residual, confidence = self._unpack_residual(
+                    self.residual(obs, configuration, action)
+                )
+                if residual is not None and confidence >= self.min_confidence:
+                    action = apply_residual(action, residual)
+            except Exception:
+                pass
 
-        try:
-            residual, confidence = self._unpack_residual(
-                self.residual(obs, configuration, action)
-            )
-        except Exception:
-            return action
-        if residual is None or confidence < self.min_confidence:
-            return action
-        return apply_residual(action, residual)
+        race_metadata = None
+        if self.enable_market_race_ordering:
+            try:
+                action, race = optimize_sell_order(
+                    obs,
+                    action,
+                    self.market_race,
+                    min_expected_margin_gain=self.market_race_min_gain,
+                )
+                race_metadata = {
+                    "applied": bool(race.applied),
+                    "expected_margin_gain": float(
+                        race.expected_margin_gain
+                    ),
+                    "baseline_score": float(race.baseline_score),
+                    "optimized_score": float(race.optimized_score),
+                    "opponent_orders": race.opponent_orders,
+                    "sell_positions": race.sell_positions,
+                }
+            except Exception:
+                race_metadata = {
+                    "applied": False,
+                    "error": True,
+                }
+
+        self.market_race.record_action(action)
+        if self.last_strategy is not None:
+            self.last_strategy["market_race"] = race_metadata
+        return action
 
     __call__ = act

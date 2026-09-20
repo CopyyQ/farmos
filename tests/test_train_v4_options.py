@@ -21,6 +21,13 @@ def _metrics(**overrides):
         "remaining_mae_turns": 0.50,
         "route_clock_logit_std": 0.05,
         "market_clock_logit_std": 0.05,
+        "terminal_margin_mae": 5000.0,
+        "terminal_margin_win_acc": 0.70,
+        "terminal_margin_corr": 0.50,
+        "route_q_margin_corr": 0.50,
+        "market_q_margin_corr": 0.50,
+        "route_q_margin_win_acc": 0.70,
+        "market_q_margin_win_acc": 0.70,
     }
     base.update(overrides)
     return base
@@ -75,3 +82,18 @@ def test_window_indices_include_last_step_of_episode():
     tail = frame.loc[windows[-1], "step"].astype(int).tolist()
     assert tail[0] == 687
     assert tail[-1] == 718
+
+
+def test_promotion_gate_requires_margin_learning():
+    assert promotion_gate(
+        _metrics(terminal_margin_mae=15000.0)
+    )["passed"] is False
+    assert promotion_gate(
+        _metrics(terminal_margin_win_acc=0.50)
+    )["passed"] is False
+    assert promotion_gate(
+        _metrics(route_q_margin_corr=0.05)
+    )["passed"] is False
+    assert promotion_gate(
+        _metrics(market_q_margin_corr=0.05)
+    )["passed"] is False

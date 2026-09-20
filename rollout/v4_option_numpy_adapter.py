@@ -8,6 +8,7 @@ import numpy as np
 
 from kaggrl.clock import resolve_clock
 from kaggrl.observation import ObservationEncoder
+from kaggrl.v4_objective import OBJECTIVE_VERSION
 from kaggrl.v4_option_numpy_runtime import V4OptionNumpyPolicy
 from kaggrl.v4_options import StepStrategyContext, V4Option
 
@@ -26,11 +27,22 @@ class V4NumpyOptionAdapter:
         min_market_probability: float = 0.65,
         allowed_market_modes=("KEEP_ROUTE",),
         allow_route_switch: bool = True,
-        route_switch_steps=(144,),
+        route_switch_steps=None,
         liquidation_max_remaining_steps: int | None = None,
+        min_route_margin_advantage: float = 500.0,
+        min_market_margin_advantage: float = 500.0,
+        require_positive_predicted_margin: bool = False,
         telemetry_limit: int = 2048,
     ):
         self.policy = V4OptionNumpyPolicy.load(model_path)
+        self.q_rank_ready = (
+            self.policy.counterfactual_q_schema
+            == "farmos_v4_counterfactual_q_v1"
+        )
+        self.q_steps = frozenset(
+            int(value)
+            for value in self.policy.counterfactual_q_steps
+        )
         self.encoder = ObservationEncoder(
             size=self.policy.input_dim,
             clock_schema="v4",
@@ -61,6 +73,12 @@ class V4NumpyOptionAdapter:
                 f"unknown allowed V4 market modes: {sorted(unknown_modes)}"
             )
         self.allow_route_switch = bool(allow_route_switch)
+        if route_switch_steps is None:
+            route_switch_steps = (
+                self.policy.counterfactual_q_steps
+                if self.q_rank_ready
+                else (144,)
+            )
         self.route_switch_steps = frozenset(
             int(value) for value in route_switch_steps
         )
@@ -68,6 +86,15 @@ class V4NumpyOptionAdapter:
             None
             if liquidation_max_remaining_steps is None
             else max(0, int(liquidation_max_remaining_steps))
+        )
+        self.min_route_margin_advantage = float(
+            min_route_margin_advantage
+        )
+        self.min_market_margin_advantage = float(
+            min_market_margin_advantage
+        )
+        self.require_positive_predicted_margin = bool(
+            require_positive_predicted_margin
         )
         self.telemetry_limit = int(telemetry_limit)
         self.reset()
@@ -86,7 +113,7 @@ class V4NumpyOptionAdapter:
             return True
         return step == 0 or step <= self.previous_step
 
-    def _compatible_route_choice(self, logits, context):
+    def _compatible_route_choice(self, logits, context, ranking=None):
         allowed = [
             (route_id, self.route_to_class[route_id])
             for route_id in context.route_ids
@@ -104,7 +131,14 @@ class V4NumpyOptionAdapter:
             np.finfo(np.float64).tiny,
             float(probabilities.sum()),
         )
-        local = int(np.argmax(probabilities))
+        if ranking is None:
+            local = int(np.argmax(probabilities))
+        else:
+            rank_values = np.asarray(
+                [ranking[index] for _, index in allowed],
+                dtype=np.float64,
+            )
+            local = int(np.argmax(rank_values))
         return int(allowed[local][0]), float(probabilities[local])
 
     def __call__(
@@ -147,22 +181,134 @@ class V4NumpyOptionAdapter:
 
         selected_route, route_confidence = (
             self._compatible_route_choice(
-                output.route_logits, context
+                output.route_logits,
+                context,
+                ranking=(
+                    output.route_values
+                    if self.q_rank_ready else None
+                ),
+            )
+        )
+        margin_objective = (
+            self.policy.objective_version == OBJECTIVE_VERSION
+        )
+        base_route_class = self.route_to_class.get(
+            int(context.base_route_id)
+        )
+        selected_route_class = self.route_to_class.get(
+            int(selected_route)
+        )
+        route_base_margin = (
+            float(output.route_values[base_route_class])
+            * self.policy.margin_scale
+            if base_route_class is not None
+            else float("nan")
+        )
+        route_candidate_margin = (
+            float(output.route_values[selected_route_class])
+            * self.policy.margin_scale
+            if selected_route_class is not None
+            else float("nan")
+        )
+        route_margin_advantage = (
+            route_candidate_margin - route_base_margin
+            if np.isfinite(route_candidate_margin)
+            and np.isfinite(route_base_margin)
+            else -float("inf")
+        )
+        route_value_ok = bool(
+            not margin_objective
+            or (
+                route_margin_advantage
+                >= self.min_route_margin_advantage
+                and (
+                    not self.require_positive_predicted_margin
+                    or route_candidate_margin > 0.0
+                )
+            )
+        )
+        route_policy_support_ok = bool(
+            self.q_rank_ready
+            or (
+                output.route_gate_probability
+                >= self.route_gate_threshold
+                and route_confidence >= self.min_route_probability
             )
         )
         route_switch_allowed = bool(
             self.allow_route_switch
             and step in self.route_switch_steps
             and selected_route != int(context.base_route_id)
-            and output.route_gate_probability
-            >= self.route_gate_threshold
-            and route_confidence >= self.min_route_probability
+            and route_policy_support_ok
+            and route_value_ok
+        )
+
+        if self.q_rank_ready:
+            eligible_market = [
+                index
+                for index, mode in enumerate(self.policy.market_modes)
+                if mode == "KEEP_ROUTE"
+                or mode in self.allowed_market_modes
+            ]
+            market_index = int(
+                eligible_market[
+                    int(np.argmax(output.market_values[eligible_market]))
+                ]
+            )
+            predicted_market_mode = str(
+                self.policy.market_modes[market_index]
+            )
+            logits = np.asarray(output.market_logits, dtype=np.float64)
+            logits -= float(np.max(logits))
+            probabilities = np.exp(logits)
+            probabilities /= max(
+                np.finfo(np.float64).tiny,
+                float(probabilities.sum()),
+            )
+            market_confidence = float(probabilities[market_index])
+        else:
+            predicted_market_mode = str(output.market_mode)
+            market_index = self.policy.market_modes.index(
+                predicted_market_mode
+            )
+            market_confidence = float(output.market_confidence)
+        keep_index = self.policy.market_modes.index("KEEP_ROUTE")
+        market_base_margin = (
+            float(output.market_values[keep_index])
+            * self.policy.margin_scale
+        )
+        market_candidate_margin = (
+            float(output.market_values[market_index])
+            * self.policy.margin_scale
+        )
+        market_margin_advantage = (
+            market_candidate_margin - market_base_margin
+        )
+        market_value_ok = bool(
+            not margin_objective
+            or (
+                market_margin_advantage
+                >= self.min_market_margin_advantage
+                and (
+                    not self.require_positive_predicted_margin
+                    or market_candidate_margin > 0.0
+                )
+            )
+        )
+        market_policy_support_ok = bool(
+            self.q_rank_ready
+            or market_confidence >= self.min_market_probability
+        )
+        market_q_step_ok = (
+            not self.q_rank_ready or step in self.q_steps
         )
         market_mode = (
-            str(output.market_mode)
+            predicted_market_mode
             if (
-                output.market_confidence >= self.min_market_probability
-                and str(output.market_mode) in self.allowed_market_modes
+                market_q_step_ok
+                and market_policy_support_ok
+                and predicted_market_mode in self.allowed_market_modes
+                and market_value_ok
             )
             else "KEEP_ROUTE"
         )
@@ -199,7 +345,16 @@ class V4NumpyOptionAdapter:
                 output.route_gate_probability
             ),
             "route_switch_allowed": route_switch_allowed,
-            "market_confidence": float(output.market_confidence),
+            "route_base_margin": float(route_base_margin),
+            "route_candidate_margin": float(route_candidate_margin),
+            "route_margin_advantage": float(route_margin_advantage),
+            "route_value_ok": bool(route_value_ok),
+            "market_confidence": float(market_confidence),
+            "market_base_margin": float(market_base_margin),
+            "market_candidate_margin": float(market_candidate_margin),
+            "market_margin_advantage": float(market_margin_advantage),
+            "market_value_ok": bool(market_value_ok),
+            "market_q_step_ok": bool(market_q_step_ok),
             "predicted_phase_id": int(output.phase_id),
             "actual_phase_id": int(context.phase_index),
             "phase_match": bool(phase_match),
@@ -209,6 +364,16 @@ class V4NumpyOptionAdapter:
             ),
             "clock_error_turns": float(clock_error),
             "clock_ok": bool(clock_ok),
+            "predicted_terminal_margin": float(
+                output.value * self.policy.margin_scale
+            ),
+            "objective_version": str(self.policy.objective_version),
+            "counterfactual_q_schema": str(
+                self.policy.counterfactual_q_schema
+            ),
+            "selection_source": (
+                "counterfactual_q" if self.q_rank_ready else "bc_policy"
+            ),
             "accepted": accepted,
             "changed": changed,
         }

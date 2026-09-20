@@ -20,6 +20,8 @@ from kaggrl.v4_option_model import V4OptionPolicy, v4_option_loss
 
 OBS_DIM = 1024
 ARCHITECTURE_VERSION = V4OptionPolicy.ARCHITECTURE_VERSION
+MARGIN_SCALE = 10000.0
+OBJECTIVE_VERSION = "terminal_margin_advantage_weighted_bc_v1"
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,20 @@ class OptionWindowDataset(Dataset):
         self.phase = frame["phase_id"].to_numpy(np.int64)
         self.step_norm = frame["step_norm"].to_numpy(np.float32)
         self.remaining_norm = frame["remaining_norm"].to_numpy(np.float32)
+        self.final_margin = frame["final_margin"].to_numpy(np.float32)
+        self.value_target = np.clip(
+            self.final_margin / MARGIN_SCALE, -5.0, 5.0
+        ).astype(np.float32)
+        self.win_target = (self.final_margin > 0.0).astype(np.float32)
+        # Advantage-weighted BC: winning/high-margin expert trajectories
+        # influence strategic heads more than losing trajectories.
+        margin_temperature = 5000.0
+        sigmoid = 1.0 / (
+            1.0 + np.exp(-self.final_margin / margin_temperature)
+        )
+        self.policy_weight = (
+            0.25 + 2.75 * sigmoid
+        ).astype(np.float32)
         steps = frame["step"].astype(int).to_numpy()
         self.clock_context = np.asarray([
             GameClock(
@@ -115,12 +131,16 @@ class OptionWindowDataset(Dataset):
             "phase": torch.from_numpy(self.phase[idx]),
             "clock_context": torch.from_numpy(self.clock_context[idx]),
             "clock_target": torch.from_numpy(clock),
+            "value_target": torch.from_numpy(self.value_target[idx]),
+            "win_target": torch.from_numpy(self.win_target[idx]),
+            "final_margin": torch.from_numpy(self.final_margin[idx]),
+            "policy_weight": torch.from_numpy(self.policy_weight[idx]),
         }
 
 
 def _load_manifest(path: pathlib.Path) -> dict:
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != "farmos_v4_option_rows_v1":
+    if manifest.get("schema_version") != "farmos_v4_option_rows_v2_margin":
         raise RuntimeError("unsupported V4 option dataset schema")
     if manifest.get("observation_schema") != "macro_semantic_v4_clock_v2":
         raise RuntimeError("V4 option dataset has wrong observation schema")
@@ -128,6 +148,10 @@ def _load_manifest(path: pathlib.Path) -> dict:
         raise RuntimeError("V4 option observation width mismatch")
     if manifest.get("route_masking") != "shop_and_phase_compatible_bitset_v1":
         raise RuntimeError("V4 option route-mask schema mismatch")
+    if manifest.get("objective") != OBJECTIVE_VERSION:
+        raise RuntimeError("V4 option objective schema mismatch")
+    if float(manifest.get("margin_scale", -1.0)) != MARGIN_SCALE:
+        raise RuntimeError("V4 option margin scale mismatch")
     return manifest
 
 
@@ -186,14 +210,22 @@ def _market_class_weights(
         train["market_mode_id"].astype(int).to_numpy(),
         minlength=int(class_count),
     ).astype(np.float64)
-    if np.any(counts <= 0):
-        raise RuntimeError(
-            f"missing market class in train split: {counts.tolist()}"
-        )
-    reference = float(np.max(counts))
-    weights = np.power(reference / counts, float(power))
-    weights = np.minimum(weights, float(cap))
-    weights = weights / max(1e-12, float(weights.mean()))
+    observed = counts > 0
+    if not np.any(observed):
+        raise RuntimeError("market BC split has no supervised classes")
+    reference = float(np.max(counts[observed]))
+    weights = np.ones(int(class_count), dtype=np.float64)
+    weights[observed] = np.power(
+        reference / counts[observed], float(power)
+    )
+    weights[observed] = np.minimum(
+        weights[observed], float(cap)
+    )
+    weights[observed] /= max(
+        1e-12, float(weights[observed].mean())
+    )
+    # Classes absent from replay are Q-only candidates. They intentionally
+    # receive no fake BC targets; counterfactual training teaches their values.
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -232,6 +264,8 @@ def _loss(
         market_target=batch["market"],
         phase_target=batch["phase"],
         clock_target=batch["clock_target"],
+        value_target=batch["value_target"],
+        policy_weight=batch["policy_weight"],
         market_class_weight=market_class_weight,
         route_gate_pos_weight=route_gate_pos_weight,
     )
@@ -291,6 +325,34 @@ def _select_route_gate_threshold(
     )
 
 
+def _margin_prediction_stats(prediction_chunks, target_chunks) -> dict:
+    predicted = (
+        torch.cat(prediction_chunks).numpy()
+        if prediction_chunks else np.zeros(1, dtype=np.float32)
+    )
+    target = (
+        torch.cat(target_chunks).numpy()
+        if target_chunks else np.zeros(1, dtype=np.float32)
+    )
+    mae = float(np.mean(np.abs(predicted - target)))
+    win_acc = float(np.mean((predicted > 0.0) == (target > 0.0)))
+    if (
+        len(predicted) >= 2
+        and float(np.std(predicted)) > 1e-8
+        and float(np.std(target)) > 1e-8
+    ):
+        corr = float(np.corrcoef(predicted, target)[0, 1])
+    else:
+        corr = 0.0
+    return {
+        "mae": mae,
+        "win_acc": win_acc,
+        "corr": corr,
+        "predicted_mean": float(np.mean(predicted)),
+        "target_mean": float(np.mean(target)),
+    }
+
+
 @torch.inference_mode()
 def evaluate(
     model, loader, device, *,
@@ -319,6 +381,12 @@ def evaluate(
     losses = []
     route_clock_values = []
     market_clock_values = []
+    margin_predictions = []
+    margin_targets = []
+    route_q_predictions = []
+    route_q_targets = []
+    market_q_predictions = []
+    market_q_targets = []
 
     for batch in loader:
         batch = _to_device(batch, device)
@@ -384,6 +452,38 @@ def evaluate(
                 -1, outputs["market_clock"].shape[-1]
             )
         )
+        margin_predictions.append(
+            (
+                outputs["value"].detach().float().cpu().reshape(-1)
+                * MARGIN_SCALE
+            )
+        )
+        margin_targets.append(
+            batch["final_margin"].detach().float().cpu().reshape(-1)
+        )
+        route_q = outputs["route_value"].gather(
+            -1, batch["route"].unsqueeze(-1)
+        ).squeeze(-1)
+        if bool(confident.any()):
+            route_q_predictions.append(
+                (
+                    route_q[confident].detach().float().cpu().reshape(-1)
+                    * MARGIN_SCALE
+                )
+            )
+            route_q_targets.append(
+                batch["final_margin"][confident]
+                .detach().float().cpu().reshape(-1)
+            )
+        market_q = outputs["market_value"].gather(
+            -1, batch["market"].unsqueeze(-1)
+        ).squeeze(-1)
+        market_q_predictions.append(
+            market_q.detach().float().cpu().reshape(-1) * MARGIN_SCALE
+        )
+        market_q_targets.append(
+            batch["final_margin"].detach().float().cpu().reshape(-1)
+        )
 
     route_clock = (
         torch.cat(route_clock_values, dim=0)
@@ -406,12 +506,27 @@ def evaluate(
         )
         for index in range(market_class_count)
     }
+    supervised_market_indices = [
+        index
+        for index in range(market_class_count)
+        if market_true_by_class[index].item() > 0
+    ]
+    supervised_market_recall = [
+        market_recall_by_class[str(index)]
+        for index in supervised_market_indices
+    ]
     market_balanced_acc = float(
-        np.mean(list(market_recall_by_class.values()))
+        np.mean(supervised_market_recall)
     )
     market_min_recall = float(
-        min(market_recall_by_class.values())
+        min(supervised_market_recall)
     )
+    if supervised_market_indices:
+        market_clock_std = float(
+            market_clock.std(
+                dim=0, unbiased=False
+            )[supervised_market_indices].mean().item()
+        )
     gate_prob = (
         torch.cat(route_gate_probabilities).numpy()
         if route_gate_probabilities
@@ -428,6 +543,32 @@ def evaluate(
         else _route_gate_stats(
             gate_prob, gate_truth, route_gate_threshold
         )
+    )
+    predicted_margin = (
+        torch.cat(margin_predictions).numpy()
+        if margin_predictions else np.zeros(1, dtype=np.float32)
+    )
+    true_margin = (
+        torch.cat(margin_targets).numpy()
+        if margin_targets else np.zeros(1, dtype=np.float32)
+    )
+    margin_mae = float(np.mean(np.abs(predicted_margin - true_margin)))
+    margin_win_acc = float(
+        np.mean((predicted_margin > 0.0) == (true_margin > 0.0))
+    )
+    if (
+        len(predicted_margin) >= 2
+        and float(np.std(predicted_margin)) > 1e-8
+        and float(np.std(true_margin)) > 1e-8
+    ):
+        margin_corr = float(np.corrcoef(predicted_margin, true_margin)[0, 1])
+    else:
+        margin_corr = 0.0
+    route_q_stats = _margin_prediction_stats(
+        route_q_predictions, route_q_targets
+    )
+    market_q_stats = _margin_prediction_stats(
+        market_q_predictions, market_q_targets
     )
 
     return {
@@ -453,6 +594,17 @@ def evaluate(
         ),
         "route_clock_logit_std": route_clock_std,
         "market_clock_logit_std": market_clock_std,
+        "terminal_margin_mae": margin_mae,
+        "terminal_margin_win_acc": margin_win_acc,
+        "terminal_margin_corr": margin_corr,
+        "predicted_margin_mean": float(np.mean(predicted_margin)),
+        "target_margin_mean": float(np.mean(true_margin)),
+        "route_q_margin_mae": route_q_stats["mae"],
+        "route_q_margin_win_acc": route_q_stats["win_acc"],
+        "route_q_margin_corr": route_q_stats["corr"],
+        "market_q_margin_mae": market_q_stats["mae"],
+        "market_q_margin_win_acc": market_q_stats["win_acc"],
+        "market_q_margin_corr": market_q_stats["corr"],
     }
 
 
@@ -489,6 +641,24 @@ def promotion_gate(metrics: dict) -> dict:
         "market_clock_logit_std_ge_0_01": (
             metrics.get("market_clock_logit_std", 0.0) >= 0.01
         ),
+        "terminal_margin_mae_le_10000": (
+            metrics.get("terminal_margin_mae", float("inf")) <= 10000.0
+        ),
+        "terminal_margin_win_acc_ge_0_55": (
+            metrics.get("terminal_margin_win_acc", 0.0) >= 0.55
+        ),
+        "route_q_margin_corr_ge_0_10": (
+            metrics.get("route_q_margin_corr", -1.0) >= 0.10
+        ),
+        "market_q_margin_corr_ge_0_10": (
+            metrics.get("market_q_margin_corr", -1.0) >= 0.10
+        ),
+        "route_q_margin_win_acc_ge_0_55": (
+            metrics.get("route_q_margin_win_acc", 0.0) >= 0.55
+        ),
+        "market_q_margin_win_acc_ge_0_55": (
+            metrics.get("market_q_margin_win_acc", 0.0) >= 0.55
+        ),
     }
     return {
         "passed": all(checks.values()),
@@ -508,6 +678,12 @@ def selection_score(metrics: dict) -> float:
         - 0.02 * metrics["remaining_mae_turns"]
         + 0.10 * metrics.get("route_clock_logit_std", 0.0)
         + 0.10 * metrics.get("market_clock_logit_std", 0.0)
+        + 0.25 * metrics.get("terminal_margin_corr", 0.0)
+        + 0.25 * metrics.get("route_q_margin_corr", 0.0)
+        + 0.50 * metrics.get("market_q_margin_corr", 0.0)
+        + 0.15 * metrics.get("route_q_margin_win_acc", 0.0)
+        + 0.15 * metrics.get("market_q_margin_win_acc", 0.0)
+        - 0.00001 * metrics.get("terminal_margin_mae", 10000.0)
     )
 
 
@@ -535,6 +711,8 @@ def _checkpoint(
         "observation_schema": manifest["observation_schema"],
         "dataset_schema": manifest["schema_version"],
         "dataset_sha256": manifest.get("output_sha256"),
+        "objective_version": OBJECTIVE_VERSION,
+        "margin_scale": MARGIN_SCALE,
         "validation_metrics": metrics,
         "route_gate_threshold": float(
             metrics.get("route_gate_threshold", 0.5)

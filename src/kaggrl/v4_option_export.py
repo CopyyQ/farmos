@@ -29,6 +29,10 @@ def export_v4_option_numpy(
     route_ids: list[int] | tuple[int, ...],
     market_modes: list[str] | tuple[str, ...],
     route_gate_threshold: float = 0.50,
+    objective_version: str = "",
+    margin_scale: float = 10000.0,
+    counterfactual_q_schema: str = "",
+    counterfactual_q_steps: list[int] | tuple[int, ...] = (),
 ) -> Path:
     if getattr(model, "ARCHITECTURE_VERSION", None) != (
         V4OptionPolicy.ARCHITECTURE_VERSION
@@ -52,6 +56,15 @@ def export_v4_option_numpy(
         "route_ids": np.asarray(route_ids, dtype=np.int32),
         "route_gate_threshold": np.asarray(
             float(route_gate_threshold), dtype=np.float32
+        ),
+        "objective_version": np.asarray(str(objective_version)),
+        "margin_scale": np.asarray(float(margin_scale), dtype=np.float32),
+        "counterfactual_q_schema": np.asarray(
+            str(counterfactual_q_schema)
+        ),
+        "counterfactual_q_steps": np.asarray(
+            [int(value) for value in counterfactual_q_steps],
+            dtype=np.int32,
         ),
         "market_modes_json": np.asarray(
             json.dumps(list(market_modes))

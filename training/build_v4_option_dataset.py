@@ -24,7 +24,7 @@ from kaggrl.v4_option_dataset import (
 from kaggrl.v4_options import MARKET_MODES
 from kaggrl.v45_macro_data import load_v45_macro_data
 
-SCHEMA_VERSION = "farmos_v4_option_rows_v1"
+SCHEMA_VERSION = "farmos_v4_option_rows_v2_margin"
 OBSERVATION_SCHEMA = "macro_semantic_v4_clock_v2"
 OBS_DIM = 1024
 
@@ -41,6 +41,10 @@ SCHEMA = pa.schema([
     ("phase_id", pa.int8()),
     ("step_norm", pa.float32()),
     ("remaining_norm", pa.float32()),
+    ("final_own_money", pa.float32()),
+    ("final_rival_money", pa.float32()),
+    ("final_margin", pa.float32()),
+    ("terminal_result", pa.int8()),
 ])
 
 
@@ -66,6 +70,10 @@ def _records(rows, split):
         "phase_id": row.phase_id,
         "step_norm": row.step_norm,
         "remaining_norm": row.remaining_norm,
+        "final_own_money": row.final_own_money,
+        "final_rival_money": row.final_rival_money,
+        "final_margin": row.final_margin,
+        "terminal_result": row.terminal_result,
     } for row in rows]
 
 
@@ -83,6 +91,8 @@ def build_dataset(
         columns=[
             "episode_id", "seat", "step", "split",
             "state_zlib", "raw_action_json",
+            "final_own_money", "final_rival_money",
+            "final_margin", "terminal_result",
         ],
     )
     frame = frame.sort_values(
@@ -90,6 +100,9 @@ def build_dataset(
         kind="stable",
     ).reset_index(drop=True)
 
+    game_outcomes = frame.groupby(
+        ["episode_id", "seat"], sort=False
+    ).first()
     routes, _, _ = load_v45_macro_data()
     route_ids = tuple(sorted(int(key) for key in routes))
     signature_table = build_route_signature_table(route_ids=route_ids)
@@ -175,7 +188,25 @@ def build_dataset(
         "turns_per_day": int(DEFAULT_TURNS_PER_DAY),
         "route_ids": list(route_ids),
         "market_modes": list(MARKET_MODES),
+        "market_bc_modes": [
+            "KEEP_ROUTE", "NO_SPEND", "LIQUIDATE_SHED",
+        ],
+        "market_q_only_modes": [
+            "HOLD_SALES", "FRONT_RUN_1", "FRONT_RUN_9",
+        ],
         "route_masking": "shop_and_phase_compatible_bitset_v1",
+        "objective": "terminal_margin_advantage_weighted_bc_v1",
+        "margin_scale": 10000.0,
+        "source_games": int(len(game_outcomes)),
+        "source_win_rate": float(
+            (game_outcomes["final_margin"].astype(float) > 0.0).mean()
+        ),
+        "source_mean_margin": float(
+            game_outcomes["final_margin"].astype(float).mean()
+        ),
+        "source_median_margin": float(
+            game_outcomes["final_margin"].astype(float).median()
+        ),
         "rows": int(total_rows),
         "groups": int(groups),
         "step_min": None if min_step is None else int(min_step),

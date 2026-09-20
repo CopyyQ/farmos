@@ -126,6 +126,7 @@ def match_v4_vs_agent(
     allowed_market_modes=None,
     allow_route_switch: bool = True,
     liquidation_max_remaining_steps: int | None = None,
+    enable_market_race_ordering: bool = True,
 ) -> dict:
     opponent_path = _resolve_opponent(opponent)
     seeds = list(seeds or [20289000, 20289001, 20289002])
@@ -172,6 +173,7 @@ def match_v4_vs_agent(
             learner = V4HybridRolloutAgent(
                 option_policy=runtime,
                 min_option_confidence=0.0,
+                enable_market_race_ordering=enable_market_race_ordering,
             )
             agents = (
                 [learner, str(opponent_path)]
@@ -246,6 +248,9 @@ def match_v4_vs_agent(
                 "option_checkpoint": (
                     None if checkpoint_path is None
                     else str(checkpoint_path)
+                ),
+                "market_race_ordering": bool(
+                    enable_market_race_ordering
                 ),
                 "seeds": seeds,
                 "summary": summary,
@@ -322,6 +327,10 @@ def main() -> None:
     )
     parser.add_argument("--disable-route-switch", action="store_true")
     parser.add_argument(
+        "--disable-market-race-ordering",
+        action="store_true",
+    )
+    parser.add_argument(
         "--liquidation-max-remaining-steps",
         type=int,
         default=None,
@@ -343,6 +352,9 @@ def main() -> None:
         allow_route_switch=not args.disable_route_switch,
         liquidation_max_remaining_steps=(
             args.liquidation_max_remaining_steps
+        ),
+        enable_market_race_ordering=(
+            not args.disable_market_race_ordering
         ),
     )
 

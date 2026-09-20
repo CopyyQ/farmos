@@ -145,3 +145,60 @@ def test_route_mask_removes_incompatible_logits_from_loss_and_metrics():
     metrics = option_metrics(outputs, **target)
     assert torch.isfinite(loss.total)
     assert metrics["route_acc_confident"] == 1.0
+
+
+def test_outcome_weight_emphasizes_winning_policy_rows():
+    common = {
+        "route": torch.tensor([[[4.0, 0.0], [4.0, 0.0]]]),
+        "route_gate_logits": torch.zeros(1, 2),
+        "route_gate": torch.full((1, 2), 0.5),
+        "market": torch.zeros(1, 2, 3),
+        "phase": torch.zeros(1, 2, 5),
+        "clock": torch.zeros(1, 2, 2),
+        "value": torch.zeros(1, 2),
+    }
+    target = {
+        "route_target": torch.tensor([[0, 1]]),
+        "route_confidence": torch.ones(1, 2),
+        "route_gate_target": torch.zeros(1, 2),
+        "market_target": torch.zeros(1, 2, dtype=torch.long),
+        "phase_target": torch.zeros(1, 2, dtype=torch.long),
+        "clock_target": torch.zeros(1, 2, 2),
+        "value_target": torch.zeros(1, 2),
+    }
+    good = v4_option_loss(
+        common, **target,
+        policy_weight=torch.tensor([[3.0, 0.25]]),
+    )
+    bad = v4_option_loss(
+        common, **target,
+        policy_weight=torch.tensor([[0.25, 3.0]]),
+    )
+    assert float(good.route) < float(bad.route)
+
+
+def test_value_head_is_trained_on_terminal_margin_target():
+    outputs = {
+        "route": torch.zeros(1, 2, 2),
+        "route_gate_logits": torch.zeros(1, 2),
+        "route_gate": torch.full((1, 2), 0.5),
+        "market": torch.zeros(1, 2, 3),
+        "phase": torch.zeros(1, 2, 5),
+        "clock": torch.zeros(1, 2, 2),
+        "value": torch.tensor([[0.0, 1.0]]),
+    }
+    target = {
+        "route_target": torch.zeros(1, 2, dtype=torch.long),
+        "route_confidence": torch.ones(1, 2),
+        "route_gate_target": torch.zeros(1, 2),
+        "market_target": torch.zeros(1, 2, dtype=torch.long),
+        "phase_target": torch.zeros(1, 2, dtype=torch.long),
+        "clock_target": torch.zeros(1, 2, 2),
+        "value_target": torch.tensor([[0.0, 1.0]]),
+    }
+    exact = v4_option_loss(outputs, **target)
+    wrong = dict(outputs)
+    wrong["value"] = torch.tensor([[2.0, -1.0]])
+    shifted = v4_option_loss(wrong, **target)
+    assert float(exact.value) == 0.0
+    assert float(shifted.value) > 0.0

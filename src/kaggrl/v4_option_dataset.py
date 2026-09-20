@@ -357,6 +357,10 @@ class V4OptionRow:
     phase_id: int
     step_norm: float
     remaining_norm: float
+    final_own_money: float
+    final_rival_money: float
+    final_margin: float
+    terminal_result: int
 
 
 def encode_option_rows(
@@ -437,6 +441,10 @@ def encode_option_rows(
             phase_id=int(clock.phase_index),
             step_norm=float(clock.step / last_step),
             remaining_norm=float(clock.remaining_steps / last_step),
+            final_own_money=float(row["final_own_money"]),
+            final_rival_money=float(row["final_rival_money"]),
+            final_margin=float(row["final_margin"]),
+            terminal_result=int(row["terminal_result"]),
         ))
     return out
 

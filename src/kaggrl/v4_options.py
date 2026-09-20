@@ -7,11 +7,21 @@ from typing import Any, Literal
 from .clock import PHASE_NAMES, GameClock, resolve_clock
 from .constants import PRODUCTS
 
-MarketMode = Literal["KEEP_ROUTE", "NO_SPEND", "LIQUIDATE_SHED"]
+MarketMode = Literal[
+    "KEEP_ROUTE",
+    "NO_SPEND",
+    "LIQUIDATE_SHED",
+    "HOLD_SALES",
+    "FRONT_RUN_1",
+    "FRONT_RUN_9",
+]
 MARKET_MODES: tuple[MarketMode, ...] = (
     "KEEP_ROUTE",
     "NO_SPEND",
     "LIQUIDATE_SHED",
+    "HOLD_SALES",
+    "FRONT_RUN_1",
+    "FRONT_RUN_9",
 )
 # WHEAT and FERTILIZER are operational inputs. A safe liquidation must not
 # remove them from the macro policy's future execution state.
@@ -189,6 +199,20 @@ def compile_market_mode(
         out["market"] = append_safe_liquidation_sales(
             observation, preferred,
         )
+        return out
+    if mode == "HOLD_SALES":
+        # Keep all funding/land/hire dependencies in their original slots and
+        # only remove sales. Q can learn when town drain / future scarcity makes
+        # waiting more valuable than selling now.
+        out["market"] = [
+            list(order)
+            for order in preferred
+            if _sell_parts(order) is None
+        ]
+        return out
+    if mode in {"FRONT_RUN_1", "FRONT_RUN_9"}:
+        # Pull-forward itself needs route tape + a suppression ledger and is
+        # therefore compiled by FarmOSV4HybridPolicy after this pure transform.
         return out
     # NO_SPEND is retained only as a diagnostic/learned label. It is blocked
     # by safe runtimes by default because deleting scheduled purchases can

@@ -11,6 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kaggrl.clock import CLOCK_FEATURES
+from kaggrl.v4_objective import OBJECTIVE_VERSION
 from kaggrl.v4_option_export import export_v4_option_numpy
 from kaggrl.v4_option_model import V4OptionPolicy
 
@@ -29,7 +30,28 @@ def export_checkpoint(checkpoint: pathlib.Path, output: pathlib.Path):
         hidden_dim=int(payload["hidden_dim"]),
         clock_dim=int(payload["clock_dim"]),
     ).eval()
-    model.load_state_dict(payload["model_state"], strict=True)
+    incompatible = model.load_state_dict(
+        payload["model_state"], strict=False
+    )
+    q_prefixes = (
+        "route_value_head.", "route_value_clock_head.",
+        "market_value_head.", "market_value_clock_head.",
+    )
+    missing_q = {
+        name for name in incompatible.missing_keys
+        if name.startswith(q_prefixes)
+    }
+    non_q_missing = set(incompatible.missing_keys) - missing_q
+    if non_q_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "V4 export checkpoint parameter mismatch: "
+            f"missing={sorted(non_q_missing)} "
+            f"unexpected={sorted(incompatible.unexpected_keys)}"
+        )
+    if payload.get("objective_version") == OBJECTIVE_VERSION and missing_q:
+        raise RuntimeError(
+            f"margin-aware checkpoint missing Q heads: {sorted(missing_q)}"
+        )
 
     export_v4_option_numpy(
         model,
@@ -38,6 +60,14 @@ def export_checkpoint(checkpoint: pathlib.Path, output: pathlib.Path):
         market_modes=payload["market_modes"],
         route_gate_threshold=float(
             payload.get("route_gate_threshold", 0.5)
+        ),
+        objective_version=str(payload.get("objective_version", "")),
+        margin_scale=float(payload.get("margin_scale", 10000.0)),
+        counterfactual_q_schema=str(
+            payload.get("counterfactual_q_schema", "")
+        ),
+        counterfactual_q_steps=payload.get(
+            "counterfactual_q_steps", []
         ),
     )
     result = {
@@ -49,6 +79,15 @@ def export_checkpoint(checkpoint: pathlib.Path, output: pathlib.Path):
         ),
         "observation_schema": payload.get("observation_schema"),
         "architecture_version": payload.get("architecture_version"),
+        "objective_version": payload.get("objective_version"),
+        "margin_scale": float(payload.get("margin_scale", 10000.0)),
+        "counterfactual_q_schema": str(
+            payload.get("counterfactual_q_schema", "")
+        ),
+        "counterfactual_q_steps": [
+            int(value)
+            for value in payload.get("counterfactual_q_steps", [])
+        ],
     }
     return result
 

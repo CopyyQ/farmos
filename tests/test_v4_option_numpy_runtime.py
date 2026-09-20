@@ -77,6 +77,18 @@ def test_v4_option_numpy_runtime_matches_torch_sequence(tmp_path):
         rtol=2e-5,
     )
     np.testing.assert_allclose(
+        np.stack([row.route_values for row in numpy_rows]),
+        torch_out["route_value"][0].numpy(),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.stack([row.market_values for row in numpy_rows]),
+        torch_out["market_value"][0].numpy(),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    np.testing.assert_allclose(
         np.asarray([
             [row.predicted_step_norm, row.predicted_remaining_norm]
             for row in numpy_rows

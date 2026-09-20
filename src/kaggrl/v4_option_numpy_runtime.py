@@ -66,6 +66,8 @@ class V4OptionNumpyOutput:
     predicted_step_norm: float
     predicted_remaining_norm: float
     value: float
+    route_values: np.ndarray
+    market_values: np.ndarray
     route_logits: np.ndarray
     market_logits: np.ndarray
     phase_logits: np.ndarray
@@ -91,6 +93,20 @@ class V4OptionNumpyPolicy:
         )
         self.route_gate_threshold = float(
             arrays.get("route_gate_threshold", 0.50)
+        )
+        self.objective_version = str(arrays.get("objective_version", ""))
+        self.margin_scale = float(arrays.get("margin_scale", 10000.0))
+        self.counterfactual_q_schema = str(
+            arrays.get("counterfactual_q_schema", "")
+        )
+        self.counterfactual_q_steps = tuple(
+            int(value)
+            for value in np.asarray(
+                arrays.get(
+                    "counterfactual_q_steps",
+                    np.asarray([], dtype=np.int32),
+                )
+            ).tolist()
         )
         self.market_modes = tuple(
             str(value)
@@ -136,6 +152,20 @@ class V4OptionNumpyPolicy:
             "value_head.bias": (1,),
             "value_clock_head.weight": (1, self.clock_dim),
         }
+        q_required = {
+            "route_value_head.weight": (len(self.route_ids), hidden),
+            "route_value_head.bias": (len(self.route_ids),),
+            "route_value_clock_head.weight": (
+                len(self.route_ids), self.clock_dim,
+            ),
+            "market_value_head.weight": (len(self.market_modes), hidden),
+            "market_value_head.bias": (len(self.market_modes),),
+            "market_value_clock_head.weight": (
+                len(self.market_modes), self.clock_dim,
+            ),
+        }
+        if self.objective_version == "terminal_margin_advantage_weighted_bc_v1":
+            required.update(q_required)
         for name, shape in required.items():
             value = self.w.get(name)
             if value is None or tuple(value.shape) != tuple(shape):
@@ -272,6 +302,35 @@ class V4OptionNumpyPolicy:
             ], dtype=np.float32)
         ).astype(np.float32)
 
+        if "route_value_head.weight" in self.w:
+            route_values = (
+                _linear(
+                    h,
+                    self.w["route_value_head.weight"],
+                    self.w["route_value_head.bias"],
+                )
+                + np.asarray(clock_context, np.float32)
+                @ self.w["route_value_clock_head.weight"].T
+            ).astype(np.float32)
+        else:
+            route_values = np.zeros(
+                len(self.route_ids), dtype=np.float32
+            )
+        if "market_value_head.weight" in self.w:
+            market_values = (
+                _linear(
+                    h,
+                    self.w["market_value_head.weight"],
+                    self.w["market_value_head.bias"],
+                )
+                + np.asarray(clock_context, np.float32)
+                @ self.w["market_value_clock_head.weight"].T
+            ).astype(np.float32)
+        else:
+            market_values = np.zeros(
+                len(self.market_modes), dtype=np.float32
+            )
+
         route_prob = _softmax(route_logits)
         market_prob = _softmax(market_logits)
         phase_prob = _softmax(phase_logits)
@@ -297,6 +356,8 @@ class V4OptionNumpyPolicy:
             predicted_step_norm=float(clock[0]),
             predicted_remaining_norm=float(clock[1]),
             value=float(value[0]),
+            route_values=route_values,
+            market_values=market_values,
             route_logits=route_logits,
             market_logits=market_logits,
             phase_logits=phase_logits,
