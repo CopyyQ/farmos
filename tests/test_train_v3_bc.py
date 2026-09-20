@@ -408,6 +408,23 @@ def test_v3_bc_records_family_counts_and_weights_when_enabled(tmp_path):
     ) <= 3.0
 
 
+def test_unit_op_balancing_boosts_rare_logistics_without_boosting_pass():
+    from training.train_v3_bc import _balanced_unit_op_weights
+
+    counts = {op: 1000 for op in UNIT_OPS}
+    counts["PASS"] = 5000
+    counts["DROP"] = 25
+    counts["PLACE"] = 100
+    weights = _balanced_unit_op_weights(
+        counts, cap=6.0, power=0.5,
+    )
+
+    assert weights["PASS"] == 1.0
+    assert weights["DROP"] == 6.0
+    assert 1.0 < weights["PLACE"] <= 6.0
+    assert weights["NORTH"] > 1.0
+
+
 def test_training_family_counts_are_scoped_by_unit_and_market(tmp_path):
     from kaggrl.v2_training_data import V2EpisodeDataset
     from training.train_v3_bc import _training_family_counts

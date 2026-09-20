@@ -46,17 +46,24 @@ def _op_weight_lookup(
 ) -> torch.Tensor:
     values = []
     scoped = None
+    op_scoped = None
     if family_weights is not None:
         candidate = family_weights.get(domain)
         scoped = candidate if isinstance(candidate, dict) else family_weights
+        candidate_op = family_weights.get(f"{domain}_op")
+        if isinstance(candidate_op, dict):
+            op_scoped = candidate_op
     for name in names:
         family = behavior_family(
             {"op": name, "kind": name if name in {"STOP_QUEUE", "NOP_SLOT"} else "ORDER"},
             domain,
         )
-        values.append(
-            1.0 if scoped is None else float(scoped.get(family, 1.0))
-        )
+        if op_scoped is not None and name in op_scoped:
+            values.append(float(op_scoped[name]))
+        else:
+            values.append(
+                1.0 if scoped is None else float(scoped.get(family, 1.0))
+            )
     return torch.tensor(values, device=device, dtype=dtype)
 
 

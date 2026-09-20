@@ -107,7 +107,16 @@ def _unit_decision_loss(
     if op not in UNIT_OP_TO_ID:
         raise ValueError(f"unknown unit op target: {op}")
     family = behavior_family(target, "unit")
-    weight = _family_weight(family_weights, "unit", family)
+    op_weights = (
+        family_weights.get("unit_op")
+        if isinstance(family_weights, dict)
+        else None
+    )
+    weight = (
+        float(op_weights.get(op, 1.0))
+        if isinstance(op_weights, dict)
+        else _family_weight(family_weights, "unit", family)
+    )
     loss = weight * _ce(decision.op_logits, UNIT_OP_TO_ID[op])
     if op in UNIT_ITEM_OPS:
         item = target.get("item")

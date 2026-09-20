@@ -134,6 +134,8 @@ class BCV3Config:
     dagger_episode_steps: int = 720
     dagger_strategy_slot: int = 0
     family_weight_cap: float | None = None
+    unit_op_weight_cap: float = 6.0
+    unit_op_weight_power: float = 0.5
     market_active_op_weight_cap: float = 8.0
     market_active_op_weight_power: float = 0.75
     teacher_mix_schedule: tuple[float, ...] = (1.0,)
@@ -235,6 +237,10 @@ class BCV3Config:
             raise ValueError("recovery_every must preserve an expert-majority schedule")
         if self.family_weight_cap is not None and float(self.family_weight_cap) < 1.0:
             raise ValueError("family_weight_cap must be >= 1 when enabled")
+        if float(self.unit_op_weight_cap) < 1.0:
+            raise ValueError("unit_op_weight_cap must be >= 1")
+        if not 0.0 <= float(self.unit_op_weight_power) <= 1.0:
+            raise ValueError("unit_op_weight_power must be in [0, 1]")
         if float(self.market_active_op_weight_cap) < 1.0:
             raise ValueError("market_active_op_weight_cap must be >= 1")
         if not 0.0 <= float(self.market_active_op_weight_power) <= 1.0:
@@ -549,6 +555,46 @@ def _training_market_continue_counts(
                 else:
                     counts["CONTINUE"] += 1
     return counts
+
+
+
+def _training_unit_op_counts(
+    dataset: V2EpisodeDataset,
+) -> dict[str, int]:
+    counts = Counter()
+    for episode in dataset:
+        for row in episode.rows:
+            action = row["canonical_action"]
+            farmer = action.get("farmer") or {"op": "PASS"}
+            counts[str(farmer.get("op", "PASS"))] += 1
+            for command in action.get("hands") or []:
+                counts[str(command.get("op", "PASS"))] += 1
+    return {
+        op: int(counts.get(op, 0))
+        for op in UNIT_OPS
+    }
+
+
+def _balanced_unit_op_weights(
+    counts: dict[str, int], *, cap: float, power: float,
+) -> dict[str, float]:
+    positive = [int(value) for value in counts.values() if int(value) > 0]
+    if not positive:
+        return {op: 1.0 for op in UNIT_OPS}
+    maximum = max(positive)
+    result = {}
+    for op in UNIT_OPS:
+        count = int(counts.get(op, 0))
+        if count <= 0:
+            result[op] = float(cap)
+        elif op == "PASS":
+            result[op] = 1.0
+        else:
+            result[op] = min(
+                float(cap),
+                (float(maximum) / float(count)) ** float(power),
+            )
+    return result
 
 
 def _training_market_active_counts(
@@ -1803,7 +1849,7 @@ def _recovery_step_loss(
     kind = str(supervision_kind)
     if kind == "smoke_only":
         return domain.market
-    if kind in {"expert", "accepted_policy"}:
+    if kind in {"expert", "accepted_policy", "teacher_demo"}:
         return domain.total
     raise ValueError(f"unknown recovery supervision_kind: {kind}")
 
@@ -1820,7 +1866,7 @@ def _recovery_update(
     use_tensor_recovery = bool(
         getattr(config, "gpu_tensor_training", False)
         and kinds
-        and kinds.issubset({"expert", "accepted_policy"})
+        and kinds.issubset({"expert", "accepted_policy", "teacher_demo"})
         and len(chunk.rows) <= int(getattr(model.core, "window", 0))
     )
 
@@ -1850,7 +1896,11 @@ def _recovery_update(
             ),
             gpu_tensor_training=True,
         )
-        total = tensor_losses["action"]
+        total = (
+            tensor_losses["total"]
+            if kinds == {"teacher_demo"}
+            else tensor_losses["action"]
+        )
         state = states[0]
     else:
         losses = []
@@ -1892,7 +1942,7 @@ def _recovery_update(
         total = torch.stack(losses).mean()
 
     if not torch.isfinite(total):
-        raise RuntimeError("non-finite v3 recovery action loss")
+        raise RuntimeError("non-finite v3 recovery loss")
     optimizer.zero_grad(set_to_none=True)
     total.backward()
     norm = torch.nn.utils.clip_grad_norm_(
@@ -3050,6 +3100,8 @@ def run_v3_bc(
             }
         ),
     )
+    unit_op_counts = None
+    unit_op_weights = None
     market_continue_counts = None
     market_active_op_counts = None
     market_active_op_weights = None
@@ -3064,6 +3116,15 @@ def run_v3_bc(
         V32_ARCHITECTURE_VERSION,
         V33_ARCHITECTURE_VERSION,
     }:
+        unit_op_counts = _training_unit_op_counts(train_data)
+        unit_op_weights = _balanced_unit_op_weights(
+            unit_op_counts,
+            cap=float(config.unit_op_weight_cap),
+            power=float(config.unit_op_weight_power),
+        )
+        if family_weights is None:
+            family_weights = {}
+        family_weights["unit_op"] = dict(unit_op_weights)
         market_continue_counts = _training_market_continue_counts(train_data)
         market_active_op_counts = _training_market_active_counts(train_data)
         market_active_op_weights = _balanced_market_active_op_weights(
@@ -3305,6 +3366,8 @@ def run_v3_bc(
         "online_dagger": bool(config.online_dagger),
         "recovery_every": int(config.recovery_every),
         "optimizer_fused": bool(optimizer_fused),
+        "unit_op_counts": unit_op_counts,
+        "unit_op_weights": unit_op_weights,
         "market_continue_counts": market_continue_counts,
         "market_active_op_counts": market_active_op_counts,
         "market_active_op_weights": market_active_op_weights,

@@ -236,7 +236,9 @@ def validate_recovery_row(row: dict[str, Any]) -> bool:
     for key in ("teacher_id", "teacher_version", "supervision_kind"):
         if not str(row.get(key, "")).strip():
             raise ValueError(f"recovery row missing {key}")
-    if row["supervision_kind"] not in {"expert", "accepted_policy", "smoke_only"}:
+    if row["supervision_kind"] not in {
+        "expert", "accepted_policy", "teacher_demo", "smoke_only",
+    }:
         raise ValueError("unknown recovery supervision_kind")
     state = row.get("state")
     action = row.get("canonical_action") or {}
@@ -854,7 +856,7 @@ def collect_teacher_demonstrations(
                     "terminal_result": int(terminal_result),
                     "teacher_id": resolved_teacher_id,
                     "teacher_version": teacher_version,
-                    "supervision_kind": "accepted_policy",
+                    "supervision_kind": "teacher_demo",
                 }
                 if strategy_slot is not None:
                     row["strategy_slot"] = int(strategy_slot)
@@ -881,7 +883,7 @@ def collect_teacher_demonstrations(
         "teacher_id": resolved_teacher_id,
         "teacher_version": teacher_version,
         "teacher_sha256": teacher_sha,
-        "supervision_kind": "accepted_policy",
+        "supervision_kind": "teacher_demo",
         "strategy_slot": (
             None if strategy_slot is None else int(strategy_slot)
         ),
