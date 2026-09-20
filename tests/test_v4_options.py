@@ -95,3 +95,28 @@ def test_keep_route_is_bit_exact_copy():
     out = compile_market_mode(_obs(), action, "KEEP_ROUTE")
     assert out == action
     assert out is not action
+
+
+def test_liquidation_preserves_base_queue_and_operational_inputs():
+    obs = _obs()
+    action = {
+        "farmer": ["PASS"],
+        "hands": [],
+        "market": [
+            ["HIRE"],
+            ["SELL", "MILK", 1],
+            ["SELL", "WHEAT", 1],
+        ],
+    }
+    out = compile_market_mode(obs, action, "LIQUIDATE_SHED")
+    assert out["market"][:3] == action["market"]
+    # Only the remaining non-operational output is appended.
+    assert out["market"][3:] == [["SELL", "MILK", 2]]
+    wheat_sold = sum(
+        order[2]
+        for order in out["market"]
+        if len(order) >= 3
+        and order[0] == "SELL"
+        and order[1] == "WHEAT"
+    )
+    assert wheat_sold == 1

@@ -13,6 +13,11 @@ MARKET_MODES: tuple[MarketMode, ...] = (
     "NO_SPEND",
     "LIQUIDATE_SHED",
 )
+# WHEAT and FERTILIZER are operational inputs. A safe liquidation must not
+# remove them from the macro policy's future execution state.
+SAFE_LIQUIDATION_PRODUCTS = tuple(
+    item for item in PRODUCTS if item not in {"WHEAT", "FERTILIZER"}
+)
 
 
 @dataclass(frozen=True)
@@ -137,6 +142,40 @@ def safe_sales_queue(
     return out[:max_slots]
 
 
+def append_safe_liquidation_sales(
+    observation: dict[str, Any],
+    base_market: list[Any] | tuple[Any, ...],
+    *,
+    max_slots: int = 10,
+) -> list[list[Any]]:
+    """Preserve base orders and append only non-operational inventory sales."""
+
+    out = [list(order) for order in (base_market or []) if order]
+    if len(out) >= max_slots:
+        return out[:max_slots]
+
+    remaining = _private_shed(observation)
+    # Reserve stock already requested by the base route so appended orders
+    # cannot double-sell the same known inventory.
+    for order in out:
+        parsed = _sell_parts(order)
+        if parsed is None:
+            continue
+        item, requested = parsed
+        remaining[item] = max(
+            0, remaining.get(item, 0) - requested
+        )
+
+    for item in SAFE_LIQUIDATION_PRODUCTS:
+        quantity = remaining.get(item, 0)
+        if quantity <= 0:
+            continue
+        out.append(["SELL", item, quantity])
+        if len(out) >= max_slots:
+            break
+    return out[:max_slots]
+
+
 def compile_market_mode(
     observation: dict[str, Any],
     action: dict[str, Any],
@@ -146,10 +185,18 @@ def compile_market_mode(
     if mode == "KEEP_ROUTE":
         return out
     preferred = list(out.get("market") or [])
+    if mode == "LIQUIDATE_SHED":
+        out["market"] = append_safe_liquidation_sales(
+            observation, preferred,
+        )
+        return out
+    # NO_SPEND is retained only as a diagnostic/learned label. It is blocked
+    # by safe runtimes by default because deleting scheduled purchases can
+    # invalidate the macro trajectory.
     out["market"] = safe_sales_queue(
         observation,
         preferred,
-        liquidate_all=(mode == "LIQUIDATE_SHED"),
+        liquidate_all=False,
     )
     return out
 

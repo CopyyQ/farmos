@@ -200,7 +200,7 @@ def test_v4_option_context_uses_reconstructed_seat1_step():
     }
 
 
-def test_v4_liquidation_mode_never_sells_more_than_known_shed():
+def test_v4_liquidation_preserves_base_and_never_adds_oversell():
     obs = {
         "player": 0,
         "step": 680,
@@ -209,6 +209,7 @@ def test_v4_liquidation_mode_never_sells_more_than_known_shed():
         "private": {"shed": {"WHEAT": 3, "MILK": 2}},
         "town": {"unlocked_shops": []},
     }
+    baseline = FarmOSV4HybridPolicy().act(obs)
     policy = FarmOSV4HybridPolicy(
         option_policy=lambda obs, cfg, ctx: (
             V4Option(route_id=2, market_mode="LIQUIDATE_SHED"),
@@ -216,12 +217,29 @@ def test_v4_liquidation_mode_never_sells_more_than_known_shed():
         )
     )
     action = policy.act(obs)
-    assert all(order[0] == "SELL" for order in action["market"])
-    sold = {}
-    for _, item, quantity in action["market"]:
-        sold[item] = sold.get(item, 0) + quantity
-    assert sold.get("WHEAT", 0) <= 3
-    assert sold.get("MILK", 0) <= 2
+    assert action["market"][:len(baseline["market"])] == baseline["market"]
+
+    def requested(market, item):
+        return sum(
+            int(order[2])
+            for order in market
+            if len(order) >= 3
+            and order[0] == "SELL"
+            and order[1] == item
+        )
+
+    base_milk = requested(baseline["market"], "MILK")
+    final_milk = requested(action["market"], "MILK")
+    # If the base already asks for more than known shed, liquidation must not
+    # make that request any larger.
+    if base_milk >= 2:
+        assert final_milk == base_milk
+    else:
+        assert final_milk <= 2
+    # WHEAT is an operational input, so liquidation never adds a WHEAT sale.
+    assert requested(action["market"], "WHEAT") == requested(
+        baseline["market"], "WHEAT"
+    )
 
 
 def test_macro_compatible_routes_follow_step_and_shop_boundaries():
