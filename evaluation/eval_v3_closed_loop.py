@@ -159,8 +159,9 @@ def evaluate_practical_gate(matrix, offline_report, thresholds=None) -> dict[str
             failures.append(f"{prefix}_missing_acquisition")
         if not _family_ok(families, "production", "service"):
             failures.append(f"{prefix}_missing_production_service")
-        if not _family_ok(families, "deposit"):
-            failures.append(f"{prefix}_missing_deposit")
+        # Kaggriculture automatically drops all farmer/hand inventory
+        # into the shed at end-of-day. Explicit DROP is therefore optional
+        # and must not be a practical-playability gate.
         if not _family_ok(families, "sale"):
             failures.append(f"{prefix}_missing_sale")
 

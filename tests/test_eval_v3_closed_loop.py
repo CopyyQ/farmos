@@ -93,9 +93,11 @@ def test_practical_gate_requires_each_seat_to_complete_chain():
     assert any("seat1" in item for item in result["failures"])
 
 
-def test_practical_gate_passes_only_complete_both_seat_evidence():
+def test_practical_gate_does_not_require_explicit_deposit():
+    # Advanced Kaggriculture auto-drops unit inventories into the shed at
+    # end-of-day, so a policy can be economically complete without DROP.
     full = {"movement": 2, "acquisition": 1, "production": 1,
-            "service": 1, "deposit": 1, "sale": 1}
+            "service": 1, "sale": 1}
     result = evaluate_practical_gate(_matrix(full), _offline())
     assert result["passed"] is True
     assert result["failures"] == []

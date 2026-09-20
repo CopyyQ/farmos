@@ -15,8 +15,25 @@ class MacroPolicy:
         self._day6 = False
         self._day27 = False
 
-    def _advance_route(self, observation):
-        step = int(observation["step"])
+    @staticmethod
+    def _step(observation, configuration=None):
+        """Return a robust absolute turn index."""
+        raw_step = observation.get("step")
+        if raw_step is not None:
+            return int(raw_step)
+        turns_per_day = 24
+        if configuration is not None:
+            if isinstance(configuration, dict):
+                turns_per_day = int(configuration.get("turnsPerDay", turns_per_day))
+            else:
+                turns_per_day = int(getattr(configuration, "turnsPerDay", turns_per_day))
+        return (
+            int(observation.get("day", 0) or 0) * turns_per_day
+            + int(observation.get("hour", 0) or 0)
+        )
+
+    def _advance_route(self, observation, configuration=None):
+        step = self._step(observation, configuration)
         if step >= 144 and not self._day6:
             shops = tuple((observation.get("town", {}).get("unlocked_shops", []) or [])[:2])
             if "YARN_STORE" in shops:
@@ -47,14 +64,17 @@ class MacroPolicy:
         action["market"] = orders
         return action
 
-    def route_id(self, observation):
-        self._advance_route(observation)
+    def route_id(self, observation, configuration=None):
+        self._advance_route(observation, configuration)
         return self._route
 
     def act(self, observation, configuration=None):
-        step = int(observation["step"])
-        self._advance_route(observation)
-        action = copy.deepcopy(self.routes[self._route][step])
+        step = self._step(observation, configuration)
+        self._advance_route(observation, configuration)
+        route = self.routes[self._route]
+        if not 0 <= step < len(route):
+            return {"farmer": ["PASS"], "hands": [], "market": []}
+        action = copy.deepcopy(route[step])
         market = action.get("market") or []
         if step == 0 and market == [["BUY_PRODUCT", "WHEAT", 5], ["BUY_PRODUCT", "WHEAT", 10], ["SELL", "WHEAT", 60]]:
             action["market"] = [["BUY_PRODUCT", "WHEAT", 70], ["SELL", "WHEAT", 70]]
