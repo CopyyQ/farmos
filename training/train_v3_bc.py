@@ -261,6 +261,16 @@ class BCV3Config:
             raise ValueError("collapse thresholds must be non-negative")
 
 
+def _should_early_stop(
+    *, epoch: int, best_epoch: int, patience: int,
+) -> bool:
+    """Count patience only after a checkpoint has been promotable."""
+    return (
+        int(best_epoch) > 0
+        and int(epoch) - int(best_epoch) >= int(patience)
+    )
+
+
 def _teacher_mix_for_epoch(schedule, epoch: int) -> float:
     values = tuple(float(value) for value in schedule)
     if not values:
@@ -3457,6 +3467,53 @@ def run_v3_bc(
         validation["promotion_failures"] = (
             [] if promotion_eligible else list(collapse.get("failures") or [])
         )
+        free_semantic = (
+            {}
+            if free is None
+            else dict(free.get("semantic") or {})
+        )
+        print(
+            "V3_VALIDATION_PROGRESS="
+            + json.dumps({
+                "epoch": int(epoch),
+                "action_only": bool(
+                    int(epoch) <= int(config.action_only_epochs)
+                ),
+                "promotion_eligible": bool(promotion_eligible),
+                "failures": list(collapse.get("failures") or []),
+                "farmer_pass_fraction": collapse.get(
+                    "farmer_pass_fraction"
+                ),
+                "hand_pass_fraction": collapse.get(
+                    "hand_pass_fraction"
+                ),
+                "stop_queue_fraction": collapse.get(
+                    "stop_queue_fraction"
+                ),
+                "farmer_op_accuracy": free_semantic.get(
+                    "farmer_op_accuracy"
+                ),
+                "hands_op_accuracy": free_semantic.get(
+                    "hands_op_accuracy"
+                ),
+                "market_op_accuracy": free_semantic.get(
+                    "market_op_accuracy"
+                ),
+                "farmer_history_gap": (
+                    None if gaps is None else gaps.get("farmer_op")
+                ),
+                "hands_history_gap": (
+                    None if gaps is None else gaps.get("hands_op")
+                ),
+                "market_history_gap": (
+                    None if gaps is None else gaps.get("market_op")
+                ),
+                "teacher_forced_total_loss": float(
+                    teacher_loss.get("total", 0.0)
+                ),
+            }, sort_keys=True),
+            flush=True,
+        )
         payload = _checkpoint_payload(
             model, optimizer, config, dataset_sha, init_sha, epoch,
             train_steps, train_metrics, validation, recurrent_stats, device,
@@ -3530,7 +3587,11 @@ def run_v3_bc(
             handle.write(json.dumps(history_row, sort_keys=True) + "\n")
         if config.max_train_steps is not None and train_steps >= config.max_train_steps:
             break
-        if epoch - best_epoch >= config.early_stop_patience:
+        if _should_early_stop(
+            epoch=epoch,
+            best_epoch=best_epoch,
+            patience=config.early_stop_patience,
+        ):
             break
 
     if not last_path.is_file():

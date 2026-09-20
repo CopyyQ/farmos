@@ -11,7 +11,7 @@ from kaggrl.constants import UNIT_OPS
 from kaggrl.v2_ledger import MARKET_OPS
 from kaggrl.v2_losses import action_loss
 from kaggrl.v3_model import TemporalIntentPolicy
-from training.train_v3_bc import BCV3Config, run_v3_bc
+from training.train_v3_bc import BCV3Config, _should_early_stop, run_v3_bc
 
 
 def _v3_init(path, dataset):
@@ -108,6 +108,13 @@ def _v33_accepted_fixture(tmp_path):
         encoding="utf-8",
     )
     return dataset, stage0, stage1, build_strategy_manifest([1])
+
+
+def test_early_stop_waits_for_first_promotable_checkpoint():
+    assert not _should_early_stop(epoch=2, best_epoch=0, patience=2)
+    assert not _should_early_stop(epoch=6, best_epoch=0, patience=2)
+    assert not _should_early_stop(epoch=4, best_epoch=3, patience=2)
+    assert _should_early_stop(epoch=5, best_epoch=3, patience=2)
 
 
 def test_v3_bc_config_declares_closed_loop_gap_thresholds():
