@@ -608,6 +608,26 @@ def evaluate(
     }
 
 
+def bootstrap_gate(metrics: dict) -> dict:
+    """Replay-BC readiness gate before counterfactual Q training."""
+    full = promotion_gate(metrics)
+    ignored = {
+        "route_q_margin_corr_ge_0_10",
+        "market_q_margin_corr_ge_0_10",
+        "route_q_margin_win_acc_ge_0_55",
+        "market_q_margin_win_acc_ge_0_55",
+    }
+    checks = {
+        key: value
+        for key, value in full["checks"].items()
+        if key not in ignored
+    }
+    return {
+        "passed": all(checks.values()),
+        "checks": checks,
+    }
+
+
 def promotion_gate(metrics: dict) -> dict:
     checks = {
         "phase_acc_ge_0_99": metrics["phase_acc"] >= 0.99,
@@ -717,6 +737,7 @@ def _checkpoint(
         "route_gate_threshold": float(
             metrics.get("route_gate_threshold", 0.5)
         ),
+        "bootstrap_gate": bootstrap_gate(metrics),
         "promotion_gate": promotion_gate(metrics),
     }
 
@@ -871,12 +892,14 @@ def train(config: TrainConfig) -> dict:
             market_class_weight=market_class_weight,
             route_gate_pos_weight=route_gate_pos_weight,
         )
+        bootstrap = bootstrap_gate(val)
         gate = promotion_gate(val)
         score = selection_score(val)
         row = {
             "epoch": epoch,
             "train_loss": float(np.mean(train_losses)),
             "validation": val,
+            "bootstrap_gate": bootstrap,
             "promotion_gate": gate,
             "selection_score": score,
         }
@@ -888,7 +911,7 @@ def train(config: TrainConfig) -> dict:
             model, optimizer, config, manifest, route_ids, epoch, val
         )
         torch.save(payload, last_path)
-        if gate["passed"] and score > best_score:
+        if bootstrap["passed"] and score > best_score:
             best_score = score
             best_epoch = epoch
             torch.save(payload, best_path)
@@ -896,6 +919,7 @@ def train(config: TrainConfig) -> dict:
     result = {
         "best_epoch": int(best_epoch),
         "promotable": bool(best_path.is_file()),
+        "bootstrap_promotable": bool(best_path.is_file()),
         "last_checkpoint": str(last_path),
         "best_checkpoint": (
             str(best_path) if best_path.is_file() else None

@@ -32,6 +32,49 @@ def _python() -> str:
     return sys.executable
 
 
+def _select_base_checkpoint(base_dir: pathlib.Path) -> pathlib.Path:
+    best = base_dir / "bc_best.pt"
+    if best.is_file():
+        return best
+
+    last = base_dir / "bc_last.pt"
+    if not last.is_file():
+        raise RuntimeError(
+            "base V4.1 checkpoint is missing; "
+            f"inspect {base_dir / 'summary.json'}"
+        )
+
+    import torch
+    sys.path.insert(0, str(ROOT))
+    from training.train_v4_options import bootstrap_gate
+
+    payload = torch.load(last, map_location="cpu", weights_only=False)
+    metrics = payload.get("validation_metrics", {})
+    gate = bootstrap_gate(metrics)
+    print(
+        "FARMOS_V4_BASE_BOOTSTRAP="
+        + json.dumps(
+            {
+                "checkpoint": str(last),
+                "bootstrap_passed": bool(gate["passed"]),
+                "failed_checks": [
+                    key
+                    for key, value in gate["checks"].items()
+                    if not value
+                ],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    if not gate["passed"]:
+        raise RuntimeError(
+            "base V4.1 did not pass bootstrap BC/safety gate; "
+            f"inspect {base_dir / 'summary.json'}"
+        )
+    return last
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -151,12 +194,7 @@ def main():
             train_args.append("--no-amp")
         _run(train_args, env=env)
 
-    base_checkpoint = base_dir / "bc_best.pt"
-    if not base_checkpoint.is_file():
-        raise RuntimeError(
-            "base V4.1 did not pass offline promotion; "
-            f"inspect {base_dir / 'summary.json'} before Q training"
-        )
+    base_checkpoint = _select_base_checkpoint(base_dir)
 
     if args.rebuild:
         for path in (cf_dataset, cf_dataset.with_suffix(".json")):
